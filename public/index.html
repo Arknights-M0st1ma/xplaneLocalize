@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#0a1118">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="XP EFB">
+  <title>X-Plane Portable EFB</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/assets/icon.svg">
+  <link rel="apple-touch-icon" href="/assets/icon.svg">
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main id="map" aria-label="Moving map"></main>
+
+  <header class="topbar glass">
+    <div class="brand"><span class="brand-mark">XP</span><span>PORTABLE EFB</span></div>
+    <div id="status" class="status waiting"><span class="status-dot"></span><span id="statusText">等待数据</span></div>
+    <button id="menuButton" class="icon-button" aria-label="打开图层和设置">☰</button>
+  </header>
+
+  <section class="instruments glass" aria-label="Flight data">
+    <div class="instrument"><span>GS</span><strong id="gs">—</strong><small>KT</small></div>
+    <div class="instrument"><span>ALT</span><strong id="alt">—</strong><small>FT MSL</small></div>
+    <div class="instrument"><span>HDG</span><strong id="hdg">—</strong><small>TRUE</small></div>
+    <div class="instrument optional"><span>V/S</span><strong id="vs">—</strong><small>FPM</small></div>
+  </section>
+
+  <div class="map-actions">
+    <button id="followButton" class="map-button active" aria-pressed="true" title="跟随飞机">⌖<span>跟随</span></button>
+    <button id="headingUpButton" class="map-button" aria-pressed="false" title="让飞机航向始终朝向画面上方">↑<span>航向向上</span></button>
+    <button id="clearTrackButton" class="map-button" title="清除轨迹">↺<span>清轨迹</span></button>
+  </div>
+
+  <aside id="drawer" class="drawer glass" aria-hidden="true">
+    <div class="drawer-head"><h1>图层与状态</h1><button id="closeButton" class="icon-button" aria-label="关闭">×</button></div>
+    <div class="drawer-section">
+      <h2>底图</h2>
+      <label class="row"><span>OpenStreetMap</span><input type="radio" name="base" value="osm" checked></label>
+      <label id="customBaseMapRow" class="row hidden"><span id="customBaseMapName">自定义底图</span><input type="radio" name="base" value="custom"></label>
+      <label id="authorizedLayerRow" class="row hidden"><span id="authorizedLayerName">授权航图</span><input type="radio" name="base" value="authorized"></label>
+      <p class="section-note">自定义 XYZ 底图须遵守服务商授权条款。</p>
+    </div>
+    <div class="drawer-section">
+      <h2>显示</h2>
+      <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
+      <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
+    </div>
+    <div class="drawer-section navigraph-card">
+      <div><h2>Navigraph</h2><p>本项目未调用或转发 Navigraph API。订阅不等于开发者授权；航点叠加与航图嵌入均须经 Navigraph 审核批准。</p></div>
+      <a id="navigraphLink" class="primary-link" target="_blank" rel="noopener noreferrer">打开官方 Charts ↗</a>
+    </div>
+    <div class="drawer-section diagnostics">
+      <h2>数据链路</h2>
+      <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
+    </div>
+    <p class="disclaimer">仅用于飞行模拟，不得用于真实导航。</p>
+  </aside>
+  <div id="scrim" class="scrim"></div>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script src="/vendor/leaflet/leaflet.js"></script>
+  <script src="/vendor/leaflet-rotate/leaflet-rotate.umd.min.js"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

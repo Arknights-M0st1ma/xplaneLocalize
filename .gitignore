@@ -1,0 +1,27 @@
+node_modules/
+.npm-cache/
+
+# 本地配置与凭据：绝不提交
+.env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
+*.pfx
+*.p12
+
+# .NET 构建产物
+windows-bridge/bin/
+windows-bridge/obj/
+windows-bridge/dist/
+*.user
+
+# 编辑器与系统文件
+.vs/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+*.log
