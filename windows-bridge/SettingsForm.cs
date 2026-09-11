@@ -24,6 +24,7 @@ internal sealed class SettingsForm : Form
     private TextBox baseMapUrl = new();
     private TextBox baseMapAttribution = new();
     private TextBox xplanePath = new();
+    private Label groundHint = new();
     private NumericUpDown groundMinZoom = new();
     private TextBox airlineLogoUrl = new();
     private TextBox simbriefUser = new();
@@ -139,7 +140,7 @@ internal sealed class SettingsForm : Form
         weatherCooldown.Tick += OnWeatherCooldownTick;
     }
 
-    private static Font PickFont()
+    internal static Font PickFont()
     {
         foreach (var name in new[] { "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI" })
         {
@@ -258,18 +259,24 @@ internal sealed class SettingsForm : Form
 
         // ---------------------------------------------------------- ground data
         xplanePath = new TextBox { Width = S(360) };
-        var browse = new Button { Text = "浏览…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(80), S(30)), Margin = new Padding(S(8), 0, 0, 0) };
-        browse.Click += (_, _) =>
-        {
-            using var dialog = new FolderBrowserDialog { Description = "选择 X-Plane 12 安装目录（包含 Resources 与 Custom Scenery 的那一层）", ShowNewFolderButton = false };
-            if (Directory.Exists(xplanePath.Text.Trim())) dialog.SelectedPath = xplanePath.Text.Trim();
-            if (dialog.ShowDialog(this) == DialogResult.OK) xplanePath.Text = dialog.SelectedPath;
-        };
+        var browse = new Button { Text = "选择文件夹…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(110), S(30)), Margin = new Padding(S(8), 0, 0, 0) };
+        browse.Click += (_, _) => BrowseForXPlane();
         var pathRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
         pathRow.Controls.Add(xplanePath);
         pathRow.Controls.Add(browse);
         AddField(stack, "X-Plane 12 安装目录", pathRow,
-            "用于读取本机 apt.dat 显示滑行道/标线/机位。只在本机读取，不会打包或上传；留空则关闭地面图层。", ErrorSlot(xplanePath));
+            "选择包含 Resources 与 Custom Scenery 的那一层（通常叫 X-Plane 12）。用于读取本机 apt.dat 显示跑道/滑行道/标线/机位，只在本机读取、不会上传；留空则关闭地面图层。", ErrorSlot(xplanePath));
+        groundHint = new Label
+        {
+            Text = "",
+            AutoSize = true,
+            MaximumSize = new Size(S(540), 0),
+            ForeColor = Color.FromArgb(105, 105, 105),
+            Margin = new Padding(0, S(3), 0, 0),
+            Visible = false
+        };
+        stack.Controls.Add(groundHint);
+        xplanePath.TextChanged += (_, _) => RefreshGroundHint();
 
         groundMinZoom = new NumericUpDown { Minimum = 10, Maximum = 19, Width = S(90), TextAlign = HorizontalAlignment.Right };
         AddField(stack, "地面图层最小缩放", groundMinZoom,
@@ -548,7 +555,10 @@ internal sealed class SettingsForm : Form
         config.CustomBaseMapName = baseMap.SelectedIndex == 1 ? baseMapName.Text.Trim() : "";
         config.CustomBaseMapUrl = baseMap.SelectedIndex == 1 ? baseMapUrl.Text.Trim() : "";
         config.CustomBaseMapAttribution = baseMap.SelectedIndex == 1 ? baseMapAttribution.Text.Trim() : "";
-        config.XplanePath = xplanePath.Text.Trim();
+        // Store the resolved installation root, not whatever level the user
+        // happened to pick, so the ground layer works on the first try.
+        var typedPath = xplanePath.Text.Trim();
+        config.XplanePath = typedPath.Length > 0 ? AptDat.ResolveRoot(typedPath) : "";
         config.GroundMinZoom = (int)Math.Clamp(groundMinZoom.Value, 10, 19);
         config.AirlineLogoUrlTemplate = airlineLogoUrl.Text.Trim();
         config.SimbriefUser = simbriefUser.Text.Trim();
@@ -771,11 +781,15 @@ internal sealed class SettingsForm : Form
         if (proxyPassword.Length > 0 && SecretProtection.Protect(proxyPassword).Length == 0)
             Fail(weatherProxyPassword, "无法加密保存代理密码（Windows 凭据服务不可用）；请改用“使用系统代理”，或清空这里的认证信息。");
 
-        var xplane = xplanePath.Text.Trim();
-        if (xplane.Length > 0)
+        var typed = xplanePath.Text.Trim();
+        if (typed.Length > 0)
         {
+            var xplane = AptDat.ResolveRoot(typed);
             if (!Directory.Exists(xplane)) Fail(xplanePath, "这个目录不存在。请选择包含 Resources 和 Custom Scenery 的 X-Plane 12 安装目录。");
-            else if (!Directory.Exists(Path.Combine(xplane, "Resources"))) Fail(xplanePath, "这个目录里没有 Resources 子目录，看起来不是 X-Plane 安装目录。");
+            else if (!Directory.Exists(Path.Combine(xplane, "Resources")))
+                Fail(xplanePath, "这个目录里没有 Resources 子目录，看起来不是 X-Plane 安装目录（可以选上一级，程序会自动往下找）。");
+            else if (AptDat.AptFiles(xplane).Count == 0)
+                Fail(xplanePath, "在 Resources 和 Custom Scenery 里都没有找到 apt.dat。如果这台电脑还没装机场数据，请先留空这一项。");
         }
         var logo = airlineLogoUrl.Text.Trim();
         if (logo.Length > 0 && (!Uri.TryCreate(logo.Replace("{icao}", "ABC"), UriKind.Absolute, out var logoUri) || logoUri.Scheme is not ("http" or "https")))
@@ -965,5 +979,70 @@ internal sealed class SettingsForm : Form
             return;
         }
         testWeatherKey.Text = $"测试连接（{weatherCooldownSeconds}s）";
+    }
+
+    // ------------------------------------------------------------ X-Plane 目录
+    // Plain WinForms picker: the Windows shell folder dialog loads third party
+    // shell extensions and a broken one takes the whole bridge down with it.
+    private void BrowseForXPlane()
+    {
+        try
+        {
+            var initial = AptDat.ResolveRoot(xplanePath.Text.Trim());
+            if (initial.Length == 0) initial = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            using var picker = new FolderPicker(
+                "选择 X-Plane 12 安装目录",
+                "选中包含 Resources 与 Custom Scenery 的那一层（通常叫 X-Plane 12）。也可以直接把路径粘贴到下面的输入框。",
+                initial,
+                DescribeXPlaneFolder);
+            if (picker.ShowDialog(this) == DialogResult.OK && picker.SelectedPath.Length > 0)
+            {
+                xplanePath.Text = picker.SelectedPath;
+                RefreshGroundHint();
+            }
+        }
+        catch (Exception error)
+        {
+            // Even a picker problem must not be able to end the process.
+            MessageBox.Show(this,
+                $"打开文件夹选择窗口时出错：{SecretProtection.Redact(error.Message)}\n\n可以把路径直接粘贴到“X-Plane 12 安装目录”输入框里，效果一样。",
+                "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private void RefreshGroundHint()
+    {
+        if (groundHint.IsDisposed) return;
+        var text = xplanePath.Text.Trim();
+        if (text.Length == 0)
+        {
+            groundHint.Visible = false;
+            groundHint.Text = "";
+            return;
+        }
+        var (message, ok) = DescribeXPlaneFolder(text);
+        groundHint.Text = message;
+        groundHint.ForeColor = ok ? Color.FromArgb(21, 115, 71) : Color.FromArgb(178, 34, 34);
+        groundHint.Visible = true;
+    }
+
+    internal static (string Text, bool Ok) DescribeXPlaneFolder(string path)
+    {
+        var typed = path.Trim().Trim('"');
+        var root = AptDat.ResolveRoot(typed);
+        if (root.Length == 0) return ("请选择包含 Resources 与 Custom Scenery 的那一层目录。", false);
+        if (!Directory.Exists(root)) return ($"这个文件夹不存在：{root}", false);
+        var files = AptDat.AptFiles(root);
+        if (files.Count == 0)
+            return ($"在这个文件夹里没有找到 apt.dat。请选择包含 Resources 的 X-Plane 12 安装目录（当前按 {root} 查找）。", false);
+        long bytes = 0;
+        foreach (var file in files)
+        {
+            try { bytes += new FileInfo(file).Length; } catch { }
+        }
+        var megabytes = bytes / 1024.0 / 1024.0;
+        var extra = File.Exists(AptDat.DefaultAptDat(root)) ? "" : "（缺少默认机场包，只会索引自定义机场）";
+        var moved = root.Equals(typed, StringComparison.OrdinalIgnoreCase) ? "" : $"，实际按 {root} 读取";
+        return ($"✓ 找到 {files.Count} 个 apt.dat，共 {megabytes:0.0} MB{extra}{moved}。保存后自动建立机场索引，iPad 上打开“🛬”并放大到设定级别即可看到。", true);
     }
 }

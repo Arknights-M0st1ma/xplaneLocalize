@@ -26,6 +26,14 @@ internal static class Program
     [STAThread]
     private static async Task Main(string[] args)
     {
+        // WinExe has no console of its own, so the command line tools below would
+        // otherwise write into nowhere when started from a terminal.
+        if (args.Length >= 1 && args[0].StartsWith("--", StringComparison.Ordinal)) ConsoleHost.Attach();
+        if (args.Length >= 2 && args[0] == "--dump-udp")
+        {
+            Environment.ExitCode = UdpDump.Run(args[1], args.Length > 2 && int.TryParse(args[2], out var seconds) ? seconds : 20);
+            return;
+        }
         if (args.Length >= 2 && args[0] == "--repair-config")
         {
             var snapshot = ConfigStore.Load(args[1]);
@@ -342,11 +350,15 @@ internal sealed class TrayContext : ApplicationContext
         config.WeatherProxyUrl = edited.WeatherProxyUrl;
         config.WeatherProxyUser = edited.WeatherProxyUser;
         config.WeatherProxyPassword = edited.WeatherProxyPassword;
+        var groundChanged = !string.Equals(config.XplanePath, edited.XplanePath, StringComparison.OrdinalIgnoreCase);
         config.XplanePath = edited.XplanePath;
         config.GroundMinZoom = edited.GroundMinZoom;
         config.AirlineLogoUrlTemplate = edited.AirlineLogoUrlTemplate;
         config.ProxyMode = edited.ProxyMode;
         config.ProxyUrl = edited.ProxyUrl;
+        // Rebuild the airport index now rather than making the iPad wait: the
+        // apt.dat read is the slow part of the ground layer.
+        if (groundChanged) service?.PrepareGround();
 
         if (portsChanged && form.RestartRequested)
         {
@@ -501,6 +513,10 @@ internal sealed class BridgeService
         this.config = config;
         web = new LocalWebServer(config);
     }
+
+    // Starts the apt.dat index in the background so the ground layer is ready by
+    // the time the iPad asks for it (saving the settings window triggers this).
+    public void PrepareGround() => web.PrepareGround();
     public async Task StopAsync()
     {
         if (Interlocked.Exchange(ref stopping, 1) != 0) return;
@@ -567,7 +583,8 @@ internal static class XPlaneParser
         {
             var row = BinaryPrimitives.ReadInt32LittleEndian(packet.AsSpan(offset, 4));
             if (row == 3) { Put(output, "indicatedAirspeedKt", F(packet, offset + 4)); Put(output, "trueAirspeedKt", F(packet, offset + 12)); Put(output, "groundSpeedKt", F(packet, offset + 16)); }
-            else if (row == 4) { Put(output, "mach", F(packet, offset + 4)); Put(output, "verticalSpeedFpm", F(packet, offset + 8)); Put(output, "gLoad", F(packet, offset + 20)); }
+            // Row 4 is "Mach, VVI, g-load": mach, VVI (fpm), g-load normal, axial, side.
+            else if (row == 4) { Put(output, "mach", F(packet, offset + 4)); Put(output, "verticalSpeedFpm", F(packet, offset + 8)); Put(output, "gLoad", F(packet, offset + 12)); }
             else if (row == 17) { Put(output, "pitchDeg", F(packet, offset + 4)); Put(output, "rollDeg", F(packet, offset + 8)); Put(output, "headingTrueDeg", F(packet, offset + 12)); Put(output, "headingMagDeg", F(packet, offset + 16)); }
             else if (row == 20)
             {
@@ -1017,6 +1034,7 @@ internal sealed class LocalWebServer
     private readonly AptDat ground;
     private readonly ConcurrentDictionary<Guid, WebSocket> viewers = new();
     private readonly Channel<string> updates = Channel.CreateBounded<string>(new BoundedChannelOptions(8) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
+    private readonly VerticalSpeedEstimator verticalSpeed = new();
     private readonly object stateLock = new();
     private Dictionary<string, object> state = [];
     private WebApplication? app;
@@ -1028,7 +1046,9 @@ internal sealed class LocalWebServer
     {
         this.config = config;
         flightPlan = new SimBriefClient(config);
-        ground = new AptDat(config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "apt-index.json"));
+        // Reads config.XplanePath on every lookup, so changing the X-Plane folder
+        // in the settings window takes effect without restarting the service.
+        ground = new AptDat(() => config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "apt-index.json"));
     }
 
     public async Task StartAsync(CancellationToken token)
@@ -1050,7 +1070,7 @@ internal sealed class LocalWebServer
             },
             // Ground layout comes from the local X-Plane installation; the EFB
             // only needs to know whether it is configured and from which zoom.
-            ground = new { configured = ground.Configured, minZoom = config.GroundMinZoom },
+            ground = GroundStatus(),
             airlineLogoUrlTemplate = config.AirlineLogoUrlTemplate,
             local = true
         }));
@@ -1063,11 +1083,28 @@ internal sealed class LocalWebServer
             JsonObject payload;
             if (!ground.Configured)
             {
-                payload = new JsonObject { ["configured"] = false, ["error"] = "未配置 X-Plane 12 安装目录" };
+                payload = new JsonObject
+                {
+                    ["configured"] = false,
+                    ["error"] = "未配置 X-Plane 12 安装目录。请在电脑端托盘“设置…”→ 地图 里选择 X-Plane 12 安装目录。"
+                };
             }
             else if (double.IsNaN(latitude) || double.IsNaN(longitude))
             {
                 payload = new JsonObject { ["configured"] = true, ["error"] = "缺少有效的经纬度" };
+            }
+            // Building the airport index reads a large apt.dat, so it runs in the
+            // background: answer immediately and let the EFB poll until it is done.
+            else if (!ground.Ready)
+            {
+                var status = GroundStatus();
+                var failure = (string?)status["error"];
+                // A failed build is reported as-is instead of being retried on
+                // every poll (that would re-read the same broken apt.dat forever).
+                if (failure is null) ground.StartBuild();
+                payload = failure is null
+                    ? new JsonObject { ["configured"] = true, ["building"] = true }
+                    : new JsonObject { ["configured"] = true, ["error"] = failure };
             }
             else
             {
@@ -1081,9 +1118,12 @@ internal sealed class LocalWebServer
             return context.Response.WriteAsync(payload.ToJsonString(), context.RequestAborted);
         });
         app.MapGet("/api/ground/status", (HttpContext context) => {
+            // ?build=1 is used by the settings window's "检查目录" button.
+            var build = context.Request.Query["build"] == "1";
+            if (build) ground.StartBuild();
             context.Response.ContentType = "application/json; charset=utf-8";
             context.Response.Headers.CacheControl = "no-store";
-            return context.Response.WriteAsync(ground.Status().ToJsonString(), context.RequestAborted);
+            return context.Response.WriteAsync(GroundStatus().ToJsonString(), context.RequestAborted);
         });
         // OpenWeatherMap overlay tiles, proxied so the key stays on the PC.
         app.MapGet("/api/weather/tile/{layer}/{z}/{x}/{y}", ServeWeatherTile);
@@ -1176,9 +1216,123 @@ internal sealed class LocalWebServer
     }
     public void Publish(Dictionary<string, object> telemetry)
     {
-        lock (stateLock) { foreach (var item in telemetry) state[item.Key] = item.Value; telemetry = new(state); }
-        updates.Writer.TryWrite(JsonSerializer.Serialize(new { type = "telemetry", payload = telemetry }));
+        Dictionary<string, object> snapshot;
+        lock (stateLock)
+        {
+            foreach (var item in telemetry) state[item.Key] = item.Value;
+            ApplyVerticalSpeed();
+            snapshot = new(state);
+        }
+        updates.Writer.TryWrite(JsonSerializer.Serialize(new { type = "telemetry", payload = snapshot }));
     }
+
+    // X-Plane reports -999 for values it cannot supply, and row 4 ("Mach, VVI,
+    // g-load") can stay at that sentinel for the whole flight. Showing "-999 FPM"
+    // is worse than useless, so an implausible value is replaced by a rate derived
+    // from the altitude stream (row 20, which is required for the map anyway).
+    private void ApplyVerticalSpeed()
+    {
+        // The parser stores boxed floats, so every numeric read has to accept both
+        // float and double - checking for double alone silently disabled this.
+        if (state.TryGetValue("altitudeMslFt", out var rawAltitude) && AsDouble(rawAltitude, out var altitude) && double.IsFinite(altitude))
+            verticalSpeed.Feed(Environment.TickCount64, altitude);
+
+        var reported = state.TryGetValue("verticalSpeedFpm", out var rawReported) && AsDouble(rawReported, out var value) ? value : double.NaN;
+        if (PlausibleVerticalSpeed(reported))
+        {
+            state["verticalSpeedSource"] = "sim";
+            return;
+        }
+        if (verticalSpeed.Value is not double derived)
+        {
+            // Nothing usable yet: let the EFB show "—" instead of a sentinel.
+            state.Remove("verticalSpeedFpm");
+            return;
+        }
+        state["verticalSpeedFpm"] = Math.Round(derived, 0);
+        state["verticalSpeedSource"] = "derived";
+    }
+
+    internal static bool AsDouble(object? raw, out double value)
+    {
+        switch (raw)
+        {
+            case double number: value = number; return true;
+            case float number: value = number; return true;
+            case int number: value = number; return true;
+            case long number: value = number; return true;
+            case decimal number: value = (double)number; return true;
+            default: value = double.NaN; return false;
+        }
+    }
+
+    internal static bool PlausibleVerticalSpeed(double value) =>
+        double.IsFinite(value) && Math.Abs(value) <= 20000 && Math.Abs(value + 999) > 1;
+
+    // Smoothed least-squares slope of the altitude samples of the last few
+    // seconds, in feet per minute.
+    internal sealed class VerticalSpeedEstimator
+    {
+        private const int WindowMs = 6000;
+        private readonly Queue<(long Ms, double Feet)> samples = new();
+        private long lastMs = -1;
+        private double lastFeet;
+        private double smoothed;
+        private bool hasValue;
+
+        public double? Value => hasValue ? smoothed : null;
+
+        public void Feed(long ms, double feet)
+        {
+            if (lastMs >= 0)
+            {
+                var gap = ms - lastMs;
+                if (gap < 20 || gap > WindowMs) samples.Clear();
+                // A teleport, a slew or an altitude resync must not be read as a
+                // 40,000 fpm climb: start a fresh window instead.
+                else if (Math.Abs(feet - lastFeet) / gap * 60000 > 15000) { samples.Clear(); hasValue = false; }
+            }
+            lastMs = ms;
+            lastFeet = feet;
+            samples.Enqueue((ms, feet));
+            while (samples.Count > 0 && ms - samples.Peek().Ms > WindowMs) samples.Dequeue();
+            var rate = Rate();
+            if (rate is not double value) return;
+            smoothed = hasValue ? smoothed * 0.7 + value * 0.3 : value;
+            hasValue = true;
+            if (Math.Abs(smoothed) < 25) smoothed = 0;
+        }
+
+        private double? Rate()
+        {
+            if (samples.Count < 3) return null;
+            var origin = samples.Peek().Ms;
+            if ((samples.Last().Ms - origin) / 1000.0 < 1.2) return null;
+            double sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+            var count = 0;
+            foreach (var (ms, feet) in samples)
+            {
+                var x = (ms - origin) / 1000.0;
+                count++;
+                sumX += x;
+                sumY += feet;
+                sumXY += x * feet;
+                sumXX += x * x;
+            }
+            var denominator = count * sumXX - sumX * sumX;
+            if (Math.Abs(denominator) < 1e-6) return null;
+            return (count * sumXY - sumX * sumY) / denominator * 60;
+        }
+    }
+
+    private JsonObject GroundStatus()
+    {
+        var status = ground.Status(false);
+        status["minZoom"] = config.GroundMinZoom;
+        return status;
+    }
+
+    public void PrepareGround() => ground.StartBuild(force: true);
 
     private async Task HandleWebSocket(HttpContext context)
     {

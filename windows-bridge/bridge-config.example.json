@@ -6,5 +6,15 @@
   "CustomBaseMapUrl": "",
   "CustomBaseMapAttribution": "",
   "SimbriefUser": "",
-  "SimbriefApiUrl": ""
+  "SimbriefApiUrl": "",
+  "WeatherApiKey": "",
+  "WeatherProxyMode": "system",
+  "WeatherProxyUrl": "",
+  "WeatherProxyUser": "",
+  "WeatherProxyPassword": "",
+  "XplanePath": "",
+  "GroundMinZoom": 15,
+  "AirlineLogoUrlTemplate": "",
+  "ProxyMode": "system",
+  "ProxyUrl": ""
 }

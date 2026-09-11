@@ -32,3 +32,13 @@ test('rejects unrelated and truncated packets', () => {
   assert.equal(parseDataPacket(Buffer.from('hello')), null);
   assert.equal(parseDataPacket(Buffer.from('DATA\0short')), null);
 });
+
+test('drops the -999 sentinel and reads g-load from the normal slot', () => {
+  const input = packet([
+    [4, [0.78, -999, 1.04, 1.01, 0.99, 0, 0, 0]],
+    [20, [31.1434, 121.8052, 12000, 11800, 0, 0, 0, 0]]
+  ]);
+  const parsed = parsePacket(input);
+  assert.equal(parsed.fields.verticalSpeedFpm, undefined);
+  assert.ok(Math.abs(parsed.fields.gLoad - 1.04) < 0.0001);
+});

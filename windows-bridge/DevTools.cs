@@ -375,6 +375,42 @@ internal static class ConfigSelfTest
         Check("超出半径不返回机场", ground.Nearest(0, 0, 5) is null);
         Check("未配置目录时明确报错", new AptDat("", "x").Status()["error"]?.GetValue<string>()?.Contains("未配置") == true);
 
+        // 14b. Picking the folder one level too high / too low must still work,
+        // and switching the X-Plane directory must rebuild without a restart.
+        Check("接受 …\\Resources 目录", AptDat.ResolveRoot(Path.Combine(xplaneRoot, "Resources")) == xplaneRoot);
+        Check("接受 apt.dat 文件路径", AptDat.ResolveRoot(Path.Combine(aptDirectory, "apt.dat")) == xplaneRoot);
+        Check("接受只包含安装目录的上一级", AptDat.ResolveRoot(directory) == xplaneRoot);
+
+        var secondRoot = Path.Combine(directory, "xplane2");
+        var secondApt = Path.Combine(secondRoot, "Resources", "default scenery", "default apt dat", "Earth nav data");
+        Directory.CreateDirectory(secondApt);
+        File.WriteAllText(Path.Combine(secondApt, "apt.dat"), """
+            1000 Version - written by WorldEditor 2.5.0r2
+
+            1  100  0  0  EGLL  London Heathrow
+            100  46.00  1  0  0.25  0  2  1  09L  51.47800000  -0.49000000  0.00  0.00  2  0  0  1  27R  51.47000000  -0.43000000  0.00  0.00  2
+            """);
+        var liveRoot = xplaneRoot;
+        var live = new AptDat(() => liveRoot, Path.Combine(directory, "apt-index-live.json"));
+        Check("热更新：初始目录索引出两个机场", (int?)live.Status()["airports"] == 2);
+        liveRoot = secondRoot;
+        Check("热更新：改目录后自动重建",
+            (int?)live.Status()["airports"] == 1 && (string?)live.Nearest(51.47, -0.45, 10)?["icao"] == "EGLL",
+            live.Status()["airports"]?.ToJsonString() ?? "");
+        liveRoot = "";
+        Check("热更新：清空目录后给出提示", live.Status()["error"]?.GetValue<string>()?.Contains("未配置") == true);
+
+        // 14c. Vertical speed: X-Plane's -999 sentinel must be rejected, and the
+        // derived value has to track a real climb.
+        Check("V/S：-999 哨兵判为无效", !LocalWebServer.PlausibleVerticalSpeed(-999) && LocalWebServer.PlausibleVerticalSpeed(-800));
+        Check("V/S：解析出的 float 也能识别",
+            LocalWebServer.AsDouble((float)1234.5, out var floatValue) && Math.Abs(floatValue - 1234.5) < 0.01
+            && !LocalWebServer.AsDouble("x", out _));
+        var estimator = new LocalWebServer.VerticalSpeedEstimator();
+        for (var step = 0; step <= 40; step++) { var ms = step * 200; estimator.Feed(ms, 5000 + ms / 60.0); }
+        Check("V/S：按高度推算 1000 fpm", Math.Abs((estimator.Value ?? 0) - 1000) < 150,
+            (estimator.Value ?? double.NaN).ToString("0.#"));
+
         try { Directory.Delete(directory, true); } catch { }
         File.WriteAllText(Path.Combine(Path.GetTempPath(), "efb-config-selftest.log"), string.Join(Environment.NewLine, lines));
         return ok ? 0 : 1;
@@ -508,7 +544,13 @@ internal static class SettingsPreview
     {
         ApplicationConfiguration.Initialize();
         var target = Path.GetFullPath(args[1]);
-        var tab = args.Length > 2 && int.TryParse(args[2], out var parsed) ? parsed : 0;
+        var mode = args.Length > 2 ? args[2] : "0";
+        if (mode is "folder" or "picker")
+        {
+            RenderFolderPicker(target, args.Length > 3 ? args[3] : null);
+            return;
+        }
+        var tab = int.TryParse(mode, out var parsed) ? parsed : 0;
         var directory = Path.Combine(Path.GetTempPath(), "efb-preview-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(directory);
         var path = Path.Combine(directory, "bridge-config.json");
@@ -544,6 +586,34 @@ internal static class SettingsPreview
         File.WriteAllLines(target + ".layout.txt", Describe(form));
         form.Close();
         try { Directory.Delete(directory, true); } catch { }
+    }
+
+    // Renders the folder picker on its own so its layout can be reviewed without
+    // a display. Usage: --settings-preview <png> folder
+    private static void RenderFolderPicker(string target, string? initial)
+    {
+        // The sandbox has no USERPROFILE, so fall back to the temp folder: the
+        // point of the preview is the layout, not the folder that is selected.
+        var start = initial ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (start.Length == 0) start = Path.GetTempPath();
+        using var picker = new FolderPicker(
+            "选择 X-Plane 12 安装目录",
+            "选中包含 Resources 与 Custom Scenery 的那一层（通常叫 X-Plane 12）。也可以直接把路径粘贴到下面的输入框。",
+            start,
+            SettingsForm.DescribeXPlaneFolder);
+        picker.StartPosition = FormStartPosition.Manual;
+        picker.Location = new Point(-4000, -4000);
+        picker.ShowInTaskbar = false;
+        picker.Show();
+        Application.DoEvents();
+        picker.PerformLayout();
+        Application.DoEvents();
+        using var bitmap = new Bitmap(picker.Width, picker.Height);
+        picker.DrawToBitmap(bitmap, new Rectangle(0, 0, picker.Width, picker.Height));
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        bitmap.Save(target, System.Drawing.Imaging.ImageFormat.Png);
+        File.WriteAllLines(target + ".layout.txt", Describe(picker));
+        picker.Close();
     }
 
     private static IEnumerable<string> Describe(Control parent, int depth = 0)

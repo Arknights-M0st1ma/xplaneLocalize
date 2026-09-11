@@ -115,10 +115,13 @@ button, a, input, select { font: inherit; }
 .ground-label { background: none; border: 0; }
 .ground-label > span {
   position: absolute; left: 0; top: 0; white-space: nowrap; display: inline-block;
-  padding: 1px 5px; border-radius: 6px; background: rgba(7,18,26,.62);
-  border: 1px solid rgba(185,218,224,.16); font-size: 12px; font-weight: 600; color: #ffe9a8;
+  padding: 1px 6px; border-radius: 6px; background: rgba(5,14,21,.78);
+  border: 1px solid rgba(255,211,77,.35); font-size: 13px; font-weight: 700; color: #ffd34d;
+  box-shadow: 0 1px 6px rgba(0,0,0,.45);
   transform: translate(-50%, -50%) rotate(calc(-1 * var(--map-rotation, 0deg)));
 }
+/* Taxiway signs and stand numbers should be told apart at a glance. */
+.ground-label > span.sign { color: #9fe8ff; border-color: rgba(159,232,255,.4); }
 .weather-icon[disabled] { opacity: .45; cursor: not-allowed; }
 .fo-aircraft { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fo-buttons { margin-left: auto; display: flex; gap: 2px; }

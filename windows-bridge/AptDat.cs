@@ -32,32 +32,60 @@ internal sealed class AptDat
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
     };
 
-    private readonly string root;
+    // The X-Plane directory is read through a callback instead of being captured
+    // once: the settings window can change it while the service keeps running and
+    // the ground layer has to follow without a restart.
+    private readonly Func<string> rootProvider;
     private readonly string cachePath;
     private readonly object gate = new();
     private Dictionary<string, Airport> index = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, JsonObject> parsed = new(StringComparer.OrdinalIgnoreCase);
+    private string builtRoot = "";
+    private List<string> files = [];
+    private long bytes;
+    private int filesDone;
     private bool built;
+    private bool building;
     private string? error;
+    private Task? buildTask;
 
-    public AptDat(string root, string cachePath)
+    public AptDat(Func<string> rootProvider, string cachePath)
     {
-        this.root = root ?? "";
+        this.rootProvider = rootProvider ?? (() => "");
         this.cachePath = cachePath;
     }
 
-    public bool Configured => root.Length > 0 && Directory.Exists(root);
+    // Convenience constructor for tests and the settings preview.
+    public AptDat(string root, string cachePath) : this(() => root, cachePath) { }
 
-    public JsonObject Status()
+    public string Root => ResolveRoot(rootProvider());
+
+    public bool Configured => IsInstall(Root);
+
+    // True once the airport index exists (or failed with a reason the UI shows).
+    public bool Ready { get { lock (gate) { return built && !building && error is null; } } }
+
+    // build: false is the HTTP path, which must never block on a 100 MB apt.dat.
+    public JsonObject Status(bool build = true)
     {
-        EnsureIndex();
-        return new JsonObject
+        if (build) EnsureIndex();
+        else { var current = Root; lock (gate) SyncRoot(current); }
+        var root = Root;
+        lock (gate)
         {
-            ["configured"] = Configured,
-            ["root"] = root,
-            ["airports"] = index.Count,
-            ["error"] = error
-        };
+            return new JsonObject
+            {
+                ["configured"] = IsInstall(root),
+                ["root"] = root,
+                ["ready"] = built && !building && error is null,
+                ["building"] = building,
+                ["airports"] = index.Count,
+                ["files"] = files.Count,
+                ["filesDone"] = filesDone,
+                ["bytes"] = bytes,
+                ["error"] = error
+            };
+        }
     }
 
     // Nearest airport to the aircraft, with its parsed ground layout.
@@ -65,9 +93,15 @@ internal sealed class AptDat
     {
         if (!Configured) return null;
         EnsureIndex();
+        Airport[] candidates;
+        lock (gate)
+        {
+            if (!built || index.Count == 0) return null;
+            candidates = [.. index.Values];
+        }
         Airport? best = null;
         var bestDistance = double.MaxValue;
-        foreach (var airport in index.Values)
+        foreach (var airport in candidates)
         {
             if (airport.Lat is not { } lat || airport.Lon is not { } lon) continue;
             var distance = DistanceNm(latitude, longitude, lat, lon);
@@ -97,57 +131,209 @@ internal sealed class AptDat
     }
 
     // ---------------------------------------------------------------- index
+    // Synchronous: returns with the index either built or failed. Used by the
+    // lookup path and by the diagnostics self test.
     private void EnsureIndex()
     {
+        var root = Root;
         lock (gate)
         {
-            if (built) return;
-            built = true;
-            if (!Configured)
+            SyncRoot(root);
+            if (built || building) return;
+        }
+        Build(root);
+    }
+
+    // Asynchronous: builds the index in the background so a large apt.dat cannot
+    // block an HTTP request (or freeze the iPad UI) on the first lookup.
+    // force: retry after a failure (the settings window does this on save).
+    public void StartBuild(bool force = false)
+    {
+        var root = Root;
+        lock (gate)
+        {
+            SyncRoot(root);
+            if (building) return;
+            // built means "already attempted for this root"; only a forced call
+            // retries, otherwise a failed build would be repeated on every poll.
+            if (built && !force) return;
+            if (!IsInstall(root))
             {
+                built = true;
                 error = "未配置 X-Plane 12 安装目录";
                 return;
             }
-            try
-            {
-                var files = AptFiles();
-                var signature = Signature(files);
-                if (TryLoadCache(signature)) return;
-                var map = new Dictionary<string, Airport>(StringComparer.OrdinalIgnoreCase);
-                foreach (var file in files) IndexFile(file, map);
-                index = map;
-                SaveCache(signature);
-            }
-            catch (Exception cause)
-            {
-                error = cause.Message;
-            }
+            building = true;
+            error = null;
+            buildTask = Task.Run(() => Build(root));
         }
     }
 
+    // The directory changed (or was emptied) since the last build: drop the old
+    // index so the next lookup rebuilds against the new location.
+    private void SyncRoot(string root)
+    {
+        if (string.Equals(builtRoot, root, StringComparison.OrdinalIgnoreCase)) return;
+        builtRoot = root;
+        built = false;
+        error = null;
+        index = new Dictionary<string, Airport>(StringComparer.OrdinalIgnoreCase);
+        parsed.Clear();
+        files = [];
+        bytes = 0;
+        filesDone = 0;
+    }
+
+    private void Build(string root)
+    {
+        try
+        {
+            if (!IsInstall(root))
+            {
+                lock (gate) { built = true; building = false; error = "未配置 X-Plane 12 安装目录"; }
+                return;
+            }
+            var list = AptFiles(root);
+            long total = 0;
+            foreach (var file in list)
+            {
+                try { total += new FileInfo(file).Length; } catch { }
+            }
+            lock (gate)
+            {
+                if (Stale(root)) { building = false; built = false; return; }
+                files = list;
+                bytes = total;
+                filesDone = 0;
+            }
+            if (list.Count == 0)
+            {
+                lock (gate)
+                {
+                    built = true;
+                    building = false;
+                    error = "在这个目录里没有找到 apt.dat（应在 Resources\\default scenery\\default apt dat\\Earth nav data，或 Custom Scenery 的机场包里）";
+                }
+                return;
+            }
+            if (TryLoadCache(root, list))
+            {
+                lock (gate) { built = true; building = false; error = null; }
+                return;
+            }
+            var map = new Dictionary<string, Airport>(StringComparer.OrdinalIgnoreCase);
+            var done = 0;
+            foreach (var file in list)
+            {
+                IndexFile(file, map);
+                done++;
+                lock (gate) filesDone = done;
+            }
+            lock (gate)
+            {
+                if (Stale(root)) { building = false; built = false; return; }
+                index = map;
+                built = true;
+                building = false;
+                error = map.Count == 0 ? "apt.dat 里没有解析到机场，文件可能不完整" : null;
+            }
+            SaveCache(root, list);
+        }
+        catch (Exception cause)
+        {
+            lock (gate) { built = true; building = false; error = cause.Message; }
+        }
+    }
+
+    // Caller holds the lock.
+    private bool Stale(string root) => !string.Equals(builtRoot, root, StringComparison.OrdinalIgnoreCase);
+
     // Default airport data plus every custom scenery package (custom scenery
-    // overrides the default, so it is indexed last).
-    private List<string> AptFiles()
+    // overrides the default, so it is indexed last). Also accepts the folder the
+    // user picked one level too high or too low.
+    public static List<string> AptFiles(string root)
     {
         var files = new List<string>();
-        void AddIfExists(string candidate)
+        void Add(string candidate)
         {
-            if (File.Exists(candidate)) files.Add(candidate);
+            try
+            {
+                if (candidate.Length > 0 && File.Exists(candidate) && !files.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                    files.Add(candidate);
+            }
+            catch { }
         }
 
-        foreach (var version in new[] { "X-Plane 12", "X-Plane 11" })
+        if (root.Length == 0) return files;
+        Add(DefaultAptDat(root));
+        Add(Path.Combine(root, "Resources", "default scenery", "Global Airports", "Earth nav data", "apt.dat"));
+        try
         {
-            AddIfExists(Path.Combine(root, "Resources", "default scenery", "default apt dat", "Earth nav data", "apt.dat"));
-        }
-        var custom = Path.Combine(root, "Custom Scenery");
-        if (Directory.Exists(custom))
-        {
-            foreach (var directory in Directory.EnumerateDirectories(custom))
+            var custom = Path.Combine(root, "Custom Scenery");
+            if (Directory.Exists(custom))
             {
-                AddIfExists(Path.Combine(directory, "Earth nav data", "apt.dat"));
+                foreach (var directory in Directory.EnumerateDirectories(custom))
+                {
+                    Add(Path.Combine(directory, "Earth nav data", "apt.dat"));
+                    Add(Path.Combine(directory, "apt.dat"));
+                }
             }
         }
+        catch { /* a locked or unreadable Custom Scenery folder must not break the rest */ }
         return files;
+    }
+
+    public static string DefaultAptDat(string root) =>
+        Path.Combine(root, "Resources", "default scenery", "default apt dat", "Earth nav data", "apt.dat");
+
+    private static bool IsInstall(string root) =>
+        root.Length > 0 && (Directory.Exists(Path.Combine(root, "Resources")) || Directory.Exists(Path.Combine(root, "Custom Scenery")));
+
+    // Accepts what users actually pick in a folder dialog: the install root, the
+    // X-Plane 12 folder inside it, the Resources folder, or the apt.dat file
+    // itself. Falls back to the trimmed input so the message can still say what
+    // was not found.
+    public static string ResolveRoot(string? path)
+    {
+        var candidate = (path ?? "").Trim().Trim('"');
+        if (candidate.Length == 0) return "";
+        try
+        {
+            if (File.Exists(candidate))
+            {
+                var file = new FileInfo(candidate);
+                if (!file.Name.Equals("apt.dat", StringComparison.OrdinalIgnoreCase)) return file.DirectoryName ?? candidate;
+                // ...\Earth nav data\apt.dat → ...\default apt dat\default scenery\Resources\<root>
+                var directory = file.Directory;
+                for (var step = 0; step < 4 && directory is not null; step++) directory = directory.Parent;
+                if (directory is not null) candidate = directory.FullName;
+            }
+            else if (!Directory.Exists(candidate) && File.Exists(candidate + ".dat")) candidate = Path.GetDirectoryName(candidate) ?? candidate;
+
+            var probes = new List<string> { candidate };
+            probes.Add(Path.Combine(candidate, "X-Plane 12"));
+            probes.Add(Path.Combine(candidate, "X-Plane 11"));
+            var parent = Directory.GetParent(candidate)?.FullName;
+            if (parent is not null) probes.Add(parent);
+            foreach (var probe in probes)
+            {
+                try
+                {
+                    if (IsInstall(probe) || File.Exists(DefaultAptDat(probe))) return probe;
+                }
+                catch { }
+            }
+            // A folder that only contains the installation: descend one level.
+            if (Directory.Exists(candidate))
+            {
+                foreach (var child in Directory.EnumerateDirectories(candidate))
+                {
+                    if (IsInstall(child)) return child;
+                }
+            }
+        }
+        catch { }
+        return candidate;
     }
 
     private static string Signature(IEnumerable<string> files)
@@ -361,15 +547,18 @@ internal sealed class AptDat
     }
 
     // ---------------------------------------------------------------- cache
-    private bool TryLoadCache(string signature)
+    private bool TryLoadCache(string root, List<string> list)
     {
         try
         {
             if (!File.Exists(cachePath)) return false;
-            var root = JsonNode.Parse(File.ReadAllText(cachePath)) as JsonObject;
-            if ((string?)root?["signature"] != signature) return false;
+            var node = JsonNode.Parse(File.ReadAllText(cachePath)) as JsonObject;
+            // The directory is part of the key: switching X-Plane installs must
+            // not silently reuse the previous installation's airport index.
+            if ((string?)node?["root"] != root) return false;
+            if ((string?)node?["signature"] != Signature(list)) return false;
             var map = new Dictionary<string, Airport>(StringComparer.OrdinalIgnoreCase);
-            foreach (var item in root?["airports"] as JsonArray ?? [])
+            foreach (var item in node?["airports"] as JsonArray ?? [])
             {
                 if (item is not JsonObject entry) continue;
                 var icao = (string?)entry["icao"];
@@ -385,15 +574,15 @@ internal sealed class AptDat
         catch { return false; }
     }
 
-    private void SaveCache(string signature)
+    private void SaveCache(string root, List<string> list)
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
-            var list = new JsonArray();
+            var entries = new JsonArray();
             foreach (var airport in index.Values)
             {
-                list.Add(new JsonObject
+                entries.Add(new JsonObject
                 {
                     ["icao"] = airport.Icao,
                     ["name"] = airport.Name,
@@ -403,7 +592,13 @@ internal sealed class AptDat
                     ["lon"] = airport.Lon
                 });
             }
-            File.WriteAllText(cachePath, new JsonObject { ["signature"] = signature, ["airports"] = list }.ToJsonString(Json), new UTF8Encoding(false));
+            var payload = new JsonObject
+            {
+                ["root"] = root,
+                ["signature"] = Signature(list),
+                ["airports"] = entries
+            };
+            File.WriteAllText(cachePath, payload.ToJsonString(Json), new UTF8Encoding(false));
         }
         catch { /* the index is rebuilt on the next start */ }
     }

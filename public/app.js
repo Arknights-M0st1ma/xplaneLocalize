@@ -1212,6 +1212,55 @@ let groundEnabled = false;
 let groundAnchor = null;
 let groundData = null;
 let groundLabelZoom = 0;
+let groundRetryTimer = 0;
+let groundNotice = '';
+let groundNoticeAt = 0;
+let groundLoadedIcao = '';
+
+function groundConfigured() {
+  return Boolean(groundConfig?.configured);
+}
+
+function groundButtonTitle() {
+  if (!groundConfigured()) return '机场地面图层：还没指定 X-Plane 12 安装目录（电脑端托盘“设置…”→ 地图）';
+  return `机场地面图层（缩放 ≥ ${groundConfig.minZoom ?? 15} 显示）`;
+}
+
+// The desktop settings window can change the X-Plane folder while this page is
+// open, so the configuration is re-read instead of being cached for the session.
+async function refreshGroundConfig() {
+  try {
+    const config = await loadConfig();
+    groundConfig = config.ground ?? null;
+    const button = $('#groundToggle');
+    if (button) button.title = groundButtonTitle();
+    if (groundEnabled && groundConfigured()) updateGroundLayer(true);
+  } catch { /* keep the previous configuration */ }
+}
+
+function notifyGround(message) {
+  const now = Date.now();
+  if (message === groundNotice && now - groundNoticeAt < 20000) return;
+  groundNotice = message;
+  groundNoticeAt = now;
+  showToast(message);
+}
+
+function setGroundDiagnostic(text) {
+  const node = $('#groundDiagnostic');
+  if (node) node.textContent = text;
+}
+
+function groundSummary(airport) {
+  const count = (list) => (list ?? []).length;
+  const parts = [];
+  if (count(airport.runways)) parts.push(`跑道 ${count(airport.runways)}`);
+  if (count(airport.pavements)) parts.push(`铺面 ${count(airport.pavements)}`);
+  if (count(airport.lines)) parts.push(`标线 ${count(airport.lines)}`);
+  if (count(airport.signs)) parts.push(`标牌 ${count(airport.signs)}`);
+  if (count(airport.parking)) parts.push(`机位 ${count(airport.parking)}`);
+  return parts.join(' · ') || '该机场没有可绘制的要素';
+}
 
 function setGroundEnabled(enabled) {
   groundEnabled = enabled;
@@ -1220,16 +1269,37 @@ function setGroundEnabled(enabled) {
   if (button) {
     button.classList.toggle('active', enabled);
     button.setAttribute('aria-pressed', String(enabled));
-    button.disabled = !groundConfig?.configured;
-    button.title = groundConfig?.configured
-      ? `机场地面图层（缩放 ≥ ${groundConfig.minZoom ?? 15} 显示）`
-      : '未配置 X-Plane 12 安装目录（在电脑端“设置…”→ 地图 里填写）';
+    // Kept clickable on purpose: pressing it re-reads the configuration, so a
+    // folder picked in the desktop settings window takes effect immediately.
+    button.disabled = false;
+    button.title = groundButtonTitle();
   }
-  if (!enabled) clearGround();
-  else updateGroundLayer(true);
+  if (!enabled)
+  {
+    clearGround();
+    setGroundDiagnostic('已关闭');
+    return;
+  }
+  const minZoom = groundConfig?.minZoom ?? 15;
+  if (!groundConfigured())
+  {
+    setGroundDiagnostic('未配置 X-Plane 12 安装目录');
+    refreshGroundConfig();
+  }
+  // Enabling it while zoomed out used to do nothing at all, which reads as
+  // "the layer is broken" - say what is missing instead.
+  else if (map.getZoom() < minZoom)
+  {
+    setGroundDiagnostic(`已开启 · 缩放到 ${minZoom} 级后加载（当前 ${Math.round(map.getZoom())}）`);
+    notifyGround(`地面图层要缩放到 ${minZoom} 级以上才会显示（当前 ${Math.round(map.getZoom())}）`);
+  }
+  else setGroundDiagnostic('已开启 · 正在加载…');
+  updateGroundLayer(true);
 }
 
 function clearGround() {
+  clearTimeout(groundRetryTimer);
+  groundRetryTimer = 0;
   for (const layer of groundLayers) if (map.hasLayer(layer)) map.removeLayer(layer);
   groundLayers.length = 0;
   for (const label of groundLabels) if (map.hasLayer(label)) map.removeLayer(label);
@@ -1237,13 +1307,23 @@ function clearGround() {
   groundAirport = '';
   groundData = null;
   groundLabelZoom = 0;
+  groundLoadedIcao = '';
+  setGroundDiagnostic(groundEnabled
+    ? (groundConfigured() ? `已开启 · 缩放到 ${groundConfig.minZoom ?? 15} 级后加载` : '未配置 X-Plane 12 安装目录')
+    : '已关闭');
 }
 
 function groundZoomReady() {
-  return groundEnabled && groundConfig?.configured && map.getZoom() >= (groundConfig.minZoom ?? 15);
+  return groundEnabled && groundConfigured() && map.getZoom() >= (groundConfig.minZoom ?? 15);
 }
 
 function updateGroundLayer(force = false) {
+  if (!groundEnabled) return;
+  if (!groundConfigured()) {
+    clearGround();
+    notifyGround('还没指定 X-Plane 12 安装目录：电脑端托盘“设置…”→ 地图 → 选择文件夹');
+    return;
+  }
   if (!groundZoomReady()) {
     if (groundLayers.length > 0 || groundLabels.length > 0) clearGround();
     return;
@@ -1267,11 +1347,37 @@ function updateGroundLayer(force = false) {
   fetch(`/api/ground/nearest?${query}`)
     .then((response) => (response.ok ? response.json() : null))
     .then((data) => {
-      if (!data?.configured) return;
+      if (!data) return;
+      if (!data.configured) {
+        clearGround();
+        notifyGround(data.error ?? '还没指定 X-Plane 12 安装目录');
+        return;
+      }
+      if (data.error) {
+        clearGround();
+        notifyGround(`${data.error}（电脑端“设置…”→ 地图 可检查目录）`);
+        return;
+      }
+      // The first lookup triggers the airport index build on the PC; apt.dat can
+      // be tens of megabytes, so poll instead of leaving the layer silently empty.
+      if (data.building) {
+        notifyGround('正在建立机场索引（首次需要读 apt.dat，请稍等几秒）…');
+        clearTimeout(groundRetryTimer);
+        groundRetryTimer = setTimeout(() => updateGroundLayer(true), 2500);
+        return;
+      }
       const airport = data.airport;
-      if (!airport) { clearGround(); return; }
+      if (!airport) {
+        clearGround();
+        notifyGround(`附近 ${8} 海里内没有机场数据`);
+        return;
+      }
       if (airport.icao === groundAirport && !force) return;
       drawGround(airport);
+      if (groundLoadedIcao !== groundAirport) {
+        groundLoadedIcao = groundAirport;
+        showToast(`${airport.icao ?? '机场'} 地面数据已加载：${groundSummary(airport)}`);
+      }
     })
     .catch(() => { });
 }
@@ -1281,45 +1387,54 @@ function drawGround(airport) {
   groundAirport = airport.icao ?? '';
   groundData = airport;
   groundLabelZoom = map.getZoom();
+  setGroundDiagnostic(`${airport.icao ?? '机场'} · ${groundSummary(airport)}`);
   const add = (layer) => { layer.addTo(map); groundLayers.push(layer); };
 
+  // Deliberately distinct from the OpenStreetMap airport rendering underneath it
+  // (which already draws pale taxiways and its own gate lettering): blue-grey
+  // aprons with a bright edge, yellow painted markings and a dark-cased runway
+  // make it obvious at a glance which lines came from apt.dat.
   for (const pavement of airport.pavements ?? []) {
     if ((pavement.points ?? []).length < 3) continue;
     add(L.polygon(pavement.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#8fb0c0', weight: 1, opacity: .5, fillColor: '#3b5566', fillOpacity: .5
+      color: '#3fb2ff', weight: 1.6, opacity: .95, fillColor: '#2f6f9a', fillOpacity: .42
     }));
   }
   for (const route of airport.routes ?? []) {
     if ((route.points ?? []).length < 2) continue;
     add(L.polyline(route.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#5aa9c9', weight: 1.5, opacity: .35, dashArray: '4 6'
+      color: '#8fd6ff', weight: 1.6, opacity: .45, dashArray: '3 7'
     }));
   }
   for (const line of airport.lines ?? []) {
     if ((line.points ?? []).length < 2) continue;
     add(L.polyline(line.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#f3f7f9', weight: 1.6, opacity: .7
+      color: '#ffd34d', weight: Math.max(2, Math.min(4, map.getZoom() - 13)), opacity: .95
     }));
   }
   for (const runway of airport.runways ?? []) {
     if (!runway.a || !runway.b) continue;
-    const weight = Math.max(5, Math.min(18, (runway.widthM ?? 45) / 6));
+    const weight = Math.max(6, Math.min(20, (runway.widthM ?? 45) / 5.5));
     add(L.polyline([runway.a, runway.b], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#5b6670', weight, opacity: .95
+      color: '#1b2530', weight: weight + 2.5, opacity: .55
     }));
     add(L.polyline([runway.a, runway.b], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#e8eef2', weight: Math.max(1, weight / 8), opacity: .9, dashArray: '6 8'
+      color: '#59636f', weight, opacity: .95
+    }));
+    add(L.polyline([runway.a, runway.b], {
+      renderer: groundRenderer, pane: 'groundPane', interactive: false,
+      color: '#ffffff', weight: Math.max(1.6, weight / 7), opacity: .92, dashArray: '7 9'
     }));
   }
   for (const parking of airport.parking ?? []) {
     add(L.circleMarker([parking.lat, parking.lon], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      radius: 3, color: '#ffd166', weight: 1, fillColor: '#ffd166', fillOpacity: .95
+      radius: 3.5, color: '#1b2530', weight: 1, fillColor: '#ffd34d', fillOpacity: 1
     }));
   }
   addGroundLabels(airport);

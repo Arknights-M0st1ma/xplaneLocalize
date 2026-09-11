@@ -1,6 +1,9 @@
 const DATA_RECORD_BYTES = 36;
 
 const finite = (value) => Number.isFinite(value) && Math.abs(value) < 1e20 ? value : null;
+// X-Plane writes -999 into slots it has no value for; that sentinel must never
+// reach the EFB as if it were a measurement (it used to show up as "V/S -999").
+const measurement = (value) => Number.isFinite(value) && Math.abs(value) < 1e20 && Math.abs(value + 999) > 1 ? value : null;
 
 /** Parse X-Plane DATA UDP packets. Values from different rows are merged by the bridge. */
 export function parseDataPacket(buffer) {
@@ -36,8 +39,8 @@ export function recordsToTelemetry(records) {
   const vertical = records[4];
   if (vertical) {
     result.mach = finite(vertical[0]);
-    result.verticalSpeedFpm = finite(vertical[1]);
-    result.gLoad = finite(vertical[4]);
+    result.verticalSpeedFpm = measurement(vertical[1]);
+    result.gLoad = finite(vertical[2]);
   }
 
   const attitude = records[17];

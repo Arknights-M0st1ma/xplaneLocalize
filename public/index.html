@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
   <!-- The version query keeps iPad Safari (and the service worker cache) from
        pairing a freshly fetched index.html with an older app bundle. -->
-  <link rel="stylesheet" href="/styles.css?v=22">
+  <link rel="stylesheet" href="/styles.css?v=24">
 </head>
 <body>
   <!-- The map area shrinks when the sidebar is open, so the sidebar never covers
@@ -143,7 +143,7 @@
       </div>
       <div class="drawer-section diagnostics">
         <h2>数据链路</h2>
-        <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
+        <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>地面图层</dt><dd id="groundDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
       </div>
       <p class="disclaimer">仅用于飞行模拟，不得用于真实导航。</p>
     </div>
@@ -167,6 +167,6 @@
   </section>
 
   <script src="/vendor/leaflet/leaflet.js"></script>
-  <script type="module" src="/app.js?v=22"></script>
+  <script type="module" src="/app.js?v=24"></script>
 </body>
 </html>
