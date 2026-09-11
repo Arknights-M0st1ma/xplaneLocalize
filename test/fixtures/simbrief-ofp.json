@@ -1,0 +1,53 @@
+{
+  "fetch": { "userid": "123456", "static_id": "", "status": "Success", "time": "0.19" },
+  "params": { "type": "B738", "orig": "ZSPD", "dest": "RJAA" },
+  "general": {
+    "aircraft_icao": "",
+    "icao_airline": "ZZZ",
+    "flight_number": "1234",
+    "route": "AND BS G455 ...",
+    "route_distance": "832",
+    "gc_distance": "792",
+    "initial_altitude": "35000",
+    "cruise_altitude": "36000"
+  },
+  "origin": {
+    "icao_code": "ZSPD", "iata_code": "PVG", "name": "Shanghai Pudong Intl",
+    "plan_rwy": "35L", "pos_lat": "31.143400", "pos_long": "121.805200"
+  },
+  "destination": {
+    "icao_code": "RJAA", "iata_code": "NRT", "name": "Tokyo Narita Intl",
+    "plan_rwy": "16R", "pos_lat": 35.764700, "pos_long": 140.386400
+  },
+  "alternate": [
+    { "icao_code": "RJTT", "iata_code": "HND", "name": "Tokyo Haneda", "plan_rwy": "34R", "pos_lat": "35.553300", "pos_long": "139.781100" }
+  ],
+  "takeoff_altn": { "icao_code": "ZSSS", "name": "Shanghai Hongqiao", "pos_lat": "31.197900", "pos_long": "121.336300" },
+  "aircraft": { "icaocode": "A346", "name": "A340-600", "reg": "N634SB" },
+  "times": {
+    "est_time_enroute": "11:12:53",
+    "sched_time_enroute": "09:47:00",
+    "sched_out": "2026-09-10T22:35:00Z",
+    "sched_off": "2026-09-10T22:55:00Z",
+    "sched_on": "2026-09-11T08:42:00Z",
+    "sched_in": "2026-09-11T08:50:00Z",
+    "est_off": "2026-09-10T22:55:00Z",
+    "est_on": "2026-09-11T10:07:53Z"
+  },
+  "params": { "request_id": "185855832", "time_generated": "2026-09-10T22:01:06Z" },
+  "text": {
+    "plan_html": "<div style=\"font-size:13px\"><pre><!--BKMK///OFP///0--><b>[ OFP ]</b> EDDF-VHHH\nEDDF 31.14N 121.81E\nVHHH 35.76N 140.39E\n  <a href=\"#\">page 1/4</a></pre></div>",
+    "tlr_section": "TAKEOFF AND LANDING REPORT EDDF-VHHH\nTLR-1"
+  },
+  "navlog": {
+    "fix": [
+      { "ident": "ZSPD", "name": "SHANGHAI", "type": "apt", "pos_lat": "31.143400", "pos_long": "121.805200", "stage": "CLB" },
+      { "ident": "AND", "name": "AND", "type": "wpt", "pos_lat": "31.450000", "pos_long": "122.100000", "via_airway": "DCT", "altitude_feet": "12000", "stage": "CLB" },
+      { "ident": "SADLI", "name": "SADLI", "type": "wpt", "pos_lat": "32.100000", "pos_long": "123.500000", "via_airway": "G455", "altitude_feet": "24000" },
+      { "ident": "TOSHI", "name": "TOSHI", "type": "vor", "pos_lat": "34.500000", "pos_long": "138.000000", "via_airway": "G455", "altitude_feet": "36000" },
+      { "ident": "MELON", "name": "MELON", "type": "ndb", "pos_lat": "35.200000", "pos_long": "139.400000", "via_airway": "Y50", "altitude_feet": "18000", "stage": "DSC" },
+      { "ident": "RJAA", "name": "TOKYO", "type": "apt", "pos_lat": "35.764700", "pos_long": "140.386400", "stage": "DSC" },
+      { "ident": "BROKEN", "type": "wpt", "pos_lat": "0.000000", "pos_long": "0.000000" }
+    ]
+  }
+}

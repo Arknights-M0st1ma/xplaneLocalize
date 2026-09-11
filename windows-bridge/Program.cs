@@ -7,6 +7,7 @@ using Microsoft.Win32;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -15,6 +16,7 @@ using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 
 namespace XPlaneEfbBridge;
@@ -24,113 +26,208 @@ internal static class Program
     [STAThread]
     private static async Task Main(string[] args)
     {
-        if (args.Length == 2 && args[0] == "--repair-config")
+        if (args.Length >= 2 && args[0] == "--repair-config")
         {
-            _ = BridgeConfig.Load(args[1]);
-            Console.WriteLine("配置文件检查/修复完成。");
+            var snapshot = ConfigStore.Load(args[1]);
+            Console.WriteLine(snapshot.Note ?? "配置文件检查完成，未做修改。");
             return;
         }
-        if (args.Length == 2 && args[0] == "--headless")
+        if (args.Length >= 2 && args[0] == "--headless")
         {
             using var cancellation = new CancellationTokenSource();
             Console.CancelKeyPress += (_, eventArgs) => { eventArgs.Cancel = true; cancellation.Cancel(); };
-            var service = new BridgeService(BridgeConfig.Load(args[1]));
+            var snapshot = ConfigStore.Load(args[1]);
+            snapshot.Config.Validate();
+            var service = new BridgeService(snapshot.Config);
             service.StatusChanged += Console.WriteLine;
             try { await service.RunAsync(cancellation.Token); }
             finally { await service.StopAsync(); }
             return;
         }
+        if (args.Length >= 2 && args[0] == "--config-selftest")
+        {
+            Environment.ExitCode = ConfigSelfTest.Run(args[1]);
+            return;
+        }
+        if (args.Length >= 2 && args[0] == "--settings-preview")
+        {
+            SettingsPreview.Render(args);
+            return;
+        }
+        if (args.Length >= 2 && args[0] == "--dump-ofp")
+        {
+            Environment.ExitCode = OfpDump.Run(args[1], args.Length > 2 ? args[2] : ConfigStore.DefaultPath);
+            return;
+        }
+        if (args.Length >= 3 && args[0] == "--parse-ofp")
+        {
+            Environment.ExitCode = OfpDump.ParseFile(args[1], args[2]);
+            return;
+        }
         ApplicationConfiguration.Initialize();
+        // A second instance would start a second service on the same ports and
+        // could write the same configuration file at the same time.
+        using var single = new Mutex(true, @"Local\XPlaneEfbBridge.Bridge", out var isFirstInstance);
+        if (!isFirstInstance)
+        {
+            MessageBox.Show(
+                "X-Plane EFB Bridge 已经在运行。\n\n请在任务栏通知区域（右下角托盘）右击图标，选择“设置…”来查看或修改配置。",
+                "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
         Application.Run(new TrayContext());
     }
 }
 
 internal sealed class BridgeConfig
 {
+    public const string ProxyNone = "none";
+    public const string ProxySystem = "system";
+    public const string ProxyManual = "manual";
+
     public int[] UdpPorts { get; set; } = [49000];
     public int WebPort { get; set; } = 8080;
     public string SourceIp { get; set; } = "";
-    public string AuthorizedChartTileUrl { get; set; } = "";
-    public string AuthorizedChartAttribution { get; set; } = "";
     public string CustomBaseMapName { get; set; } = "";
     public string CustomBaseMapUrl { get; set; } = "";
     public string CustomBaseMapAttribution { get; set; } = "";
-    public string NavigraphExternalUrl { get; set; } = "https://charts.navigraph.com/";
+    // SimBrief Pilot ID (1-7 digits) or Navigraph alias. Empty disables the route overlay.
+    public string SimbriefUser { get; set; } = "";
+    public string SimbriefApiUrl { get; set; } = "";
+    // OpenWeatherMap API key for the optional weather overlays. It stays on this
+    // PC: the EFB asks the bridge for tiles, never for the key.
+    public string WeatherApiKey { get; set; } = "";
+    // OpenWeatherMap requests can use their own proxy (default: system proxy),
+    // independent from the SimBrief/global one above. The password is stored
+    // DPAPI-encrypted, never in clear text.
+    public string WeatherProxyMode { get; set; } = ProxySystem;
+    public string WeatherProxyUrl { get; set; } = "";
+    public string WeatherProxyUser { get; set; } = "";
+    public string WeatherProxyPassword { get; set; } = "";
+    // X-Plane installation directory (for apt.dat ground data) and the zoom at
+    // which that layer is allowed to appear.
+    public string XplanePath { get; set; } = "";
+    public int GroundMinZoom { get; set; } = 15;
+    // Optional airline logo URL template, e.g.
+    // https://example.com/airlines/{icao}_200.png — empty means "badge only".
+    public string AirlineLogoUrlTemplate { get; set; } = "";
+    // system = Windows proxy settings (including PAC, the default),
+    // none = always direct, manual = the explicit host:port below.
+    public string ProxyMode { get; set; } = ProxySystem;
+    public string ProxyUrl { get; set; } = "";
 
-    public static BridgeConfig Load(string path)
+    public BridgeConfig Clone() => new()
     {
-        var source = File.ReadAllText(path);
-        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true, AllowTrailingCommas = true, ReadCommentHandling = JsonCommentHandling.Skip };
-        BridgeConfig loaded;
-        var repaired = false;
-        try
+        UdpPorts = [.. UdpPorts],
+        WebPort = WebPort,
+        SourceIp = SourceIp,
+        CustomBaseMapName = CustomBaseMapName,
+        CustomBaseMapUrl = CustomBaseMapUrl,
+        CustomBaseMapAttribution = CustomBaseMapAttribution,
+        SimbriefUser = SimbriefUser,
+        SimbriefApiUrl = SimbriefApiUrl,
+        WeatherApiKey = WeatherApiKey,
+        WeatherProxyMode = WeatherProxyMode,
+        WeatherProxyUrl = WeatherProxyUrl,
+        WeatherProxyUser = WeatherProxyUser,
+        WeatherProxyPassword = WeatherProxyPassword,
+        XplanePath = XplanePath,
+        GroundMinZoom = GroundMinZoom,
+        AirlineLogoUrlTemplate = AirlineLogoUrlTemplate,
+        ProxyMode = ProxyMode,
+        ProxyUrl = ProxyUrl
+    };
+
+    // Fills in nulls from a hand edited file and clamps the proxy mode to a known
+    // value. Never touches values the user actually wrote.
+    public void Normalize()
+    {
+        UdpPorts = UdpPorts is { Length: > 0 } ? UdpPorts : [49000];
+        SourceIp = (SourceIp ?? "").Trim();
+        CustomBaseMapName = (CustomBaseMapName ?? "").Trim();
+        CustomBaseMapUrl = (CustomBaseMapUrl ?? "").Trim();
+        CustomBaseMapAttribution = (CustomBaseMapAttribution ?? "").Trim();
+        SimbriefUser = (SimbriefUser ?? "").Trim();
+        SimbriefApiUrl = (SimbriefApiUrl ?? "").Trim();
+        WeatherApiKey = (WeatherApiKey ?? "").Trim();
+        WeatherProxyUrl = (WeatherProxyUrl ?? "").Trim();
+        WeatherProxyUser = (WeatherProxyUser ?? "").Trim();
+        WeatherProxyPassword ??= "";
+        XplanePath = (XplanePath ?? "").Trim();
+        AirlineLogoUrlTemplate = (AirlineLogoUrlTemplate ?? "").Trim();
+        GroundMinZoom = GroundMinZoom is >= 10 and <= 19 ? GroundMinZoom : 15;
+        WeatherProxyMode = (WeatherProxyMode ?? "").Trim().ToLowerInvariant() switch
         {
-            loaded = JsonSerializer.Deserialize<BridgeConfig>(source, options) ?? new BridgeConfig();
-        }
-        catch (JsonException error)
+            ProxyNone => ProxyNone,
+            ProxyManual => ProxyManual,
+            _ => ProxySystem
+        };
+        ProxyUrl = (ProxyUrl ?? "").Trim();
+        ProxyMode = (ProxyMode ?? "").Trim().ToLowerInvariant() switch
         {
-            if (!TryExtractCurrentConfig(source, out var validObject))
-                throw new InvalidDataException("配置文件不是合法 JSON。请确保文件中只有一个以 { 开始、以 } 结束的对象。", error);
-            loaded = JsonSerializer.Deserialize<BridgeConfig>(validObject, options) ?? new BridgeConfig();
-            repaired = true;
-        }
-        loaded.SourceIp ??= "";
-        loaded.AuthorizedChartTileUrl ??= "";
-        loaded.AuthorizedChartAttribution ??= "";
-        loaded.CustomBaseMapName ??= "";
-        loaded.CustomBaseMapUrl ??= "";
-        loaded.CustomBaseMapAttribution ??= "";
-        loaded.NavigraphExternalUrl ??= "https://charts.navigraph.com/";
-        if (loaded.WebPort is < 1 or > 65535 || loaded.UdpPorts is null || loaded.UdpPorts.Length == 0 || loaded.UdpPorts.Any(port => port is < 1 or > 65535))
-            throw new InvalidDataException("端口必须是 1–65535，且至少配置一个 UDP 端口。");
-        if (repaired)
-        {
-            var backup = $"{path}.invalid-{DateTime.Now:yyyyMMdd-HHmmssfff}.bak";
-            File.Copy(path, backup, false);
-            File.WriteAllText(path, JsonSerializer.Serialize(loaded, new JsonSerializerOptions { WriteIndented = true }));
-        }
-        return loaded;
+            ProxyNone => ProxyNone,
+            ProxySystem => ProxySystem,
+            ProxyManual => ProxyManual,
+            _ => ProxySystem
+        };
     }
 
-    private static bool TryExtractCurrentConfig(string source, out string json)
+    // Only what the bridge needs in order to run. Everything else is reported as
+    // a warning so a hand edited file never stops the app from starting.
+    public void Validate()
     {
-        var candidates = new List<(string Json, int Score, int Order)>();
-        var depth = 0; var start = -1; var inString = false; var escaped = false; var order = 0;
-        for (var index = 0; index < source.Length; index++)
-        {
-            var character = source[index];
-            if (inString)
-            {
-                if (escaped) escaped = false;
-                else if (character == '\\') escaped = true;
-                else if (character == '"') inString = false;
-                continue;
-            }
-            if (character == '"') { inString = true; continue; }
-            if (character == '{') { if (depth++ == 0) start = index; continue; }
-            if (character != '}' || depth == 0) continue;
-            if (--depth != 0 || start < 0) continue;
-            var candidate = source[start..(index + 1)];
-            try
-            {
-                var node = JsonNode.Parse(candidate, documentOptions: new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip })?.AsObject();
-                if (node is null) continue;
-                var score = node.Any(item => string.Equals(item.Key, nameof(WebPort), StringComparison.OrdinalIgnoreCase)) ? 100 : 0;
-                score += node.Any(item => string.Equals(item.Key, nameof(UdpPorts), StringComparison.OrdinalIgnoreCase)) ? 10 : 0;
-                candidates.Add((candidate, score, order++));
-            }
-            catch (JsonException) { }
-        }
-        var selected = candidates.OrderByDescending(item => item.Score).ThenByDescending(item => item.Order).FirstOrDefault();
-        json = selected.Json ?? "";
-        return json.Length > 0;
+        if (WebPort is < 1 or > 65535)
+            throw new InvalidDataException($"网页端口 {WebPort} 无效：必须是 1–65535。请在“设置…”中修正。");
+        if (UdpPorts is null || UdpPorts.Length == 0)
+            throw new InvalidDataException("UDP 端口列表为空：至少需要一个 1–65535 的端口。请在“设置…”中修正。");
+        var bad = UdpPorts.Where(port => port is < 1 or > 65535).ToArray();
+        if (bad.Length > 0)
+            throw new InvalidDataException($"UDP 端口 {bad[0]} 无效：必须是 1–65535。请在“设置…”中修正。");
     }
+
+    public List<string> Warnings()
+    {
+        var warnings = new List<string>();
+        if (WebPort is < 1 or > 65535)
+            warnings.Add($"网页端口 {WebPort} 不在 1–65535 范围内，设置窗口会按限制值显示，请修正后保存。");
+        var invalidPorts = UdpPorts.Where(port => port is < 1 or > 65535).ToArray();
+        if (invalidPorts.Length > 0)
+            warnings.Add($"UDP 端口 {string.Join(", ", invalidPorts)} 不在 1–65535 范围内，请修正后保存。");
+        if (UdpPorts.GroupBy(port => port).Any(group => group.Count() > 1))
+            warnings.Add("UDP 端口列表里有重复项，运行时会自动去重。");
+        if (SourceIp.Length > 0)
+        {
+            if (!IPAddress.TryParse(SourceIp, out var parsed))
+                warnings.Add($"来源 IP“{SourceIp}”不是合法的 IP 地址，当前会拒绝所有 UDP 数据。");
+            else if (parsed.AddressFamily != AddressFamily.InterNetwork)
+                warnings.Add($"来源 IP“{SourceIp}”不是 IPv4 地址。");
+        }
+        if (CustomBaseMapUrl.Length > 0)
+        {
+            if (!CustomBaseMapUrl.Contains("{z}") || !CustomBaseMapUrl.Contains("{x}") || !CustomBaseMapUrl.Contains("{y}"))
+                warnings.Add("自定义底图 URL 缺少 {z}/{x}/{y} 占位符，iPad 上将无法取图。");
+            else if (!Uri.TryCreate(CustomBaseMapUrl, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https"))
+                warnings.Add("自定义底图 URL 必须是 http:// 或 https:// 开头的完整地址。");
+        }
+        if (ProxyMode == ProxyManual && ProxyUrl.Length == 0)
+            warnings.Add("代理模式是“手动”，但代理地址为空。");
+        if (WeatherProxyMode == ProxyManual && WeatherProxyUrl.Length == 0)
+            warnings.Add("天气代理是“自定义”，但代理地址为空。");
+        if (WeatherProxyUrl.Contains('@'))
+            warnings.Add("天气代理地址里不要带凭据，请改用下边的用户名/密码字段（会加密保存）。");
+        if (WeatherProxyUser.Length > 0 && SecretProtection.Unprotect(WeatherProxyPassword).Length == 0)
+            warnings.Add("天气代理填了用户名但没有可用的密码：请在设置里重新输入代理密码。");
+        if (ContainsSecret(SimbriefApiUrl))
+            warnings.Add("SimBrief 端点里带有疑似密钥参数，建议改用系统代理或自建代理，不要把长期密钥写进配置文件。");
+        return warnings;
+    }
+
+    public static bool ContainsSecret(string url) =>
+        url.Length > 0 && (url.Contains('@') || url.Contains("key=", StringComparison.OrdinalIgnoreCase) || url.Contains("token=", StringComparison.OrdinalIgnoreCase));
 }
 
 internal sealed class TrayContext : ApplicationContext
 {
-    private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    private const string RunName = "XPlaneEfbBridge";
     private readonly NotifyIcon icon;
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem addressesItem;
@@ -139,53 +236,147 @@ internal sealed class TrayContext : ApplicationContext
     private readonly string configPath;
     private CancellationTokenSource serviceCancellation = new();
     private BridgeService? service;
+    private ConfigSnapshot snapshot;
     private BridgeConfig config = new();
+    private bool pendingRestart;
     private bool exiting;
 
     public TrayContext()
     {
         dispatcher.CreateControl();
         _ = dispatcher.Handle;
-        var configDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XPlaneEfbBridge");
-        Directory.CreateDirectory(configDir);
-        configPath = Path.Combine(configDir, "bridge-config.json");
-        var firstRun = EnsureConfig();
+        configPath = ConfigStore.DefaultPath;
+        var firstRun = !File.Exists(configPath);
+        snapshot = ConfigStore.Load(configPath);
+        config = snapshot.Config;
 
         statusItem = new ToolStripMenuItem("正在启动…") { Enabled = false };
         addressesItem = new ToolStripMenuItem("iPad 访问地址") { Enabled = false };
-        autoStartItem = new ToolStripMenuItem("开机自动启动") { Checked = IsAutoStart(), CheckOnClick = true };
-        autoStartItem.Click += (_, _) => SetAutoStart(autoStartItem.Checked);
+        autoStartItem = new ToolStripMenuItem("开机自动启动") { Checked = SafeAutoStart(), CheckOnClick = true };
+        autoStartItem.Click += (_, _) => { try { AutoStart.Set(autoStartItem.Checked); } catch { } };
+        var advancedMenu = new ToolStripMenuItem("高级");
+        advancedMenu.DropDownItems.Add("用记事本打开配置文件", null, (_, _) => OpenConfig());
+        advancedMenu.DropDownItems.Add("打开配置文件夹", null, (_, _) => OpenConfigFolder());
         var menu = new ContextMenuStrip();
         menu.Items.Add(statusItem);
         menu.Items.Add(addressesItem);
         menu.Items.Add("在本机打开 EFB", null, (_, _) => OpenEfb());
+        menu.Items.Add("设置…", null, (_, _) => OpenSettings());
         menu.Items.Add("显示访问说明", null, (_, _) => ShowAddresses());
-        menu.Items.Add("打开配置", null, (_, _) => OpenConfig());
-        menu.Items.Add("重新加载配置", null, async (_, _) => await RestartAsync());
+        menu.Items.Add(advancedMenu);
+        menu.Items.Add("重新加载配置（重启服务）", null, async (_, _) => await RestartAsync());
         menu.Items.Add(autoStartItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, async (_, _) => await ExitAsync());
-        icon = new NotifyIcon { Icon = SystemIcons.Application, Text = "X-Plane EFB Bridge", Visible = true, ContextMenuStrip = menu };
+        icon = new NotifyIcon { Icon = AppIcon.Load(), Text = "X-Plane EFB Bridge", Visible = true, ContextMenuStrip = menu };
         icon.DoubleClick += (_, _) => OpenEfb();
         StartService();
         if (firstRun) ShowAddresses(true);
+        else if (snapshot.Note is not null) NotifyConfigNote();
     }
 
-    private bool EnsureConfig()
+    private void NotifyConfigNote()
     {
-        if (File.Exists(configPath)) return false;
-        File.WriteAllText(configPath, JsonSerializer.Serialize(new BridgeConfig(), new JsonSerializerOptions { WriteIndented = true }));
-        return true;
+        try
+        {
+            icon.BalloonTipTitle = "X-Plane EFB Bridge 配置提示";
+            icon.BalloonTipText = snapshot.Note!.Length > 250 ? snapshot.Note![..250] + "…" : snapshot.Note!;
+            icon.ShowBalloonTip(8000);
+        }
+        catch { }
     }
 
-    private BridgeConfig LoadConfig() => BridgeConfig.Load(configPath);
+    private static void CopyInto(BridgeConfig target, BridgeConfig source)
+    {
+        target.UdpPorts = [.. source.UdpPorts];
+        target.WebPort = source.WebPort;
+        target.SourceIp = source.SourceIp;
+        target.CustomBaseMapName = source.CustomBaseMapName;
+        target.CustomBaseMapUrl = source.CustomBaseMapUrl;
+        target.CustomBaseMapAttribution = source.CustomBaseMapAttribution;
+        target.SimbriefUser = source.SimbriefUser;
+        target.SimbriefApiUrl = source.SimbriefApiUrl;
+        target.WeatherApiKey = source.WeatherApiKey;
+        target.WeatherProxyMode = source.WeatherProxyMode;
+        target.WeatherProxyUrl = source.WeatherProxyUrl;
+        target.WeatherProxyUser = source.WeatherProxyUser;
+        target.WeatherProxyPassword = source.WeatherProxyPassword;
+        target.XplanePath = source.XplanePath;
+        target.GroundMinZoom = source.GroundMinZoom;
+        target.AirlineLogoUrlTemplate = source.AirlineLogoUrlTemplate;
+        target.ProxyMode = source.ProxyMode;
+        target.ProxyUrl = source.ProxyUrl;
+    }
+
+    // Picks up hand edits (and anything the settings window wrote) without
+    // breaking the single shared configuration instance the running service uses.
+    private void RebindConfigFromDisk()
+    {
+        snapshot = ConfigStore.Load(configPath);
+        CopyInto(config, snapshot.Config);
+    }
+
+    private void OpenSettings()
+    {
+        try { RebindConfigFromDisk(); }
+        catch (Exception error)
+        {
+            MessageBox.Show($"无法读取配置文件：\n{error.Message}\n\n路径：{configPath}", "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        using var form = new SettingsForm(snapshot, LanAddress.First(config.WebPort));
+        if (form.ShowDialog() != DialogResult.OK || form.Result is null) return;
+        snapshot = form.NewSnapshot ?? snapshot;
+
+        var edited = form.Result;
+        var portsChanged = edited.WebPort != config.WebPort || !edited.UdpPorts.SequenceEqual(config.UdpPorts);
+        // Everything except the listening ports is read per use, so it applies now.
+        config.SourceIp = edited.SourceIp;
+        config.CustomBaseMapName = edited.CustomBaseMapName;
+        config.CustomBaseMapUrl = edited.CustomBaseMapUrl;
+        config.CustomBaseMapAttribution = edited.CustomBaseMapAttribution;
+        config.SimbriefUser = edited.SimbriefUser;
+        config.SimbriefApiUrl = edited.SimbriefApiUrl;
+        config.WeatherApiKey = edited.WeatherApiKey;
+        config.WeatherProxyMode = edited.WeatherProxyMode;
+        config.WeatherProxyUrl = edited.WeatherProxyUrl;
+        config.WeatherProxyUser = edited.WeatherProxyUser;
+        config.WeatherProxyPassword = edited.WeatherProxyPassword;
+        config.XplanePath = edited.XplanePath;
+        config.GroundMinZoom = edited.GroundMinZoom;
+        config.AirlineLogoUrlTemplate = edited.AirlineLogoUrlTemplate;
+        config.ProxyMode = edited.ProxyMode;
+        config.ProxyUrl = edited.ProxyUrl;
+
+        if (portsChanged && form.RestartRequested)
+        {
+            pendingRestart = false;
+            _ = RestartAsync();
+        }
+        else if (portsChanged)
+        {
+            // The window already told the user; keep the tray honest about which
+            // ports are actually listening right now.
+            pendingRestart = true;
+        }
+        else
+        {
+            pendingRestart = false;
+        }
+        UpdateStatusHint();
+    }
+
+    private void UpdateStatusHint()
+    {
+        if (pendingRestart) statusItem.Text = "配置已保存 · 端口改动待重启服务生效";
+    }
 
     private void StartService()
     {
         try
         {
-            config = LoadConfig();
-            addressesItem.Text = $"iPad: {FirstLanUrl(config.WebPort)}";
+            config.Validate();
+            addressesItem.Text = $"iPad: {LanAddress.First(config.WebPort)}";
             service = new BridgeService(config);
             service.StatusChanged += text => { if (exiting || dispatcher.IsDisposed) return; dispatcher.BeginInvoke(() => {
                 if (exiting) return;
@@ -213,50 +404,36 @@ internal sealed class TrayContext : ApplicationContext
         if (service is not null) await service.StopAsync();
         serviceCancellation.Dispose();
         serviceCancellation = new CancellationTokenSource();
+        try { RebindConfigFromDisk(); pendingRestart = false; }
+        catch (Exception error) { MessageBox.Show($"无法读取配置文件：\n{error.Message}", "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         StartService();
     }
 
-    private static IEnumerable<string> LanUrls(int port) => NetworkInterface.GetAllNetworkInterfaces()
-        .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up && adapter.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-        .SelectMany(adapter => {
-            var properties = adapter.GetIPProperties();
-            var hasGateway = properties.GatewayAddresses.Any(gateway => gateway.Address.AddressFamily == AddressFamily.InterNetwork && !gateway.Address.Equals(IPAddress.Any));
-            var isWireless = adapter.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
-            return properties.UnicastAddresses
-                .Where(address => address.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address.Address))
-                .Select(address => new { address.Address, HasGateway = hasGateway, IsWireless = isWireless });
-        })
-        .OrderByDescending(item => item.HasGateway)
-        .ThenByDescending(item => item.IsWireless)
-        .ThenBy(item => item.Address.ToString(), StringComparer.Ordinal)
-        .Select(item => $"http://{item.Address}:{port}")
-        .Distinct();
-    private static string FirstLanUrl(int port) => LanUrls(port).FirstOrDefault() ?? $"http://电脑IP:{port}";
-
     private void ShowAddresses(bool firstRun = false)
     {
-        var urls = string.Join(Environment.NewLine, LanUrls(config.WebPort));
+        var urls = string.Join(Environment.NewLine, LanAddress.All(config.WebPort));
         if (urls.Length == 0) urls = $"http://电脑局域网IPv4:{config.WebPort}";
         var prefix = firstRun ? $"配置文件已创建：\n{configPath}\n\n" : "";
         MessageBox.Show($"{prefix}请让 iPad 和电脑连接同一 Wi-Fi，然后在 Safari 打开：\n\n{urls}\n\nXP12 UDP 目标端口：{string.Join(", ", config.UdpPorts)}", "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void OpenEfb() => Process.Start(new ProcessStartInfo($"http://127.0.0.1:{config.WebPort}") { UseShellExecute = true });
+    private void OpenConfigFolder()
+    {
+        var directory = ConfigStore.DirectoryFor(configPath);
+        Directory.CreateDirectory(directory);
+        Process.Start(new ProcessStartInfo("explorer.exe", $"\"{directory}\"") { UseShellExecute = true });
+    }
     private void OpenConfig()
     {
         var start = new ProcessStartInfo("notepad.exe") { UseShellExecute = true };
         start.ArgumentList.Add(configPath);
         Process.Start(start);
     }
-    private bool IsAutoStart()
+    private static bool SafeAutoStart()
     {
-        using var key = Registry.CurrentUser.OpenSubKey(RunKey);
-        return key?.GetValue(RunName) is not null;
-    }
-    private void SetAutoStart(bool enabled)
-    {
-        using var key = Registry.CurrentUser.CreateSubKey(RunKey);
-        if (enabled) key.SetValue(RunName, $"\"{Environment.ProcessPath}\""); else key.DeleteValue(RunName, false);
+        try { return AutoStart.IsEnabled(); }
+        catch { return false; }
     }
     private async Task ExitAsync()
     {
@@ -277,6 +454,36 @@ internal sealed class TrayContext : ApplicationContext
             ExitThread();
         }
     }
+}
+
+// The addresses the iPad can use, most likely first (has a gateway, wireless).
+internal static class LanAddress
+{
+    public static IEnumerable<string> All(int port) => NetworkInterface.GetAllNetworkInterfaces()
+        .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up && adapter.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+        .SelectMany(adapter => {
+            var properties = adapter.GetIPProperties();
+            var hasGateway = properties.GatewayAddresses.Any(gateway => gateway.Address.AddressFamily == AddressFamily.InterNetwork && !gateway.Address.Equals(IPAddress.Any));
+            var isWireless = adapter.NetworkInterfaceType == NetworkInterfaceType.Wireless80211;
+            return properties.UnicastAddresses
+                .Where(address => address.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address.Address))
+                .Select(address => new { address.Address, HasGateway = hasGateway, IsWireless = isWireless });
+        })
+        .OrderByDescending(item => item.HasGateway)
+        .ThenByDescending(item => item.IsWireless)
+        .ThenBy(item => item.Address.ToString(), StringComparer.Ordinal)
+        .Select(item => $"http://{item.Address}:{port}")
+        .Distinct();
+
+    public static string First(int port) => All(port).FirstOrDefault() ?? $"http://电脑IP:{port}";
+
+    public static IReadOnlyList<string> Addresses() => NetworkInterface.GetAllNetworkInterfaces()
+        .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up && adapter.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+        .SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses)
+        .Where(address => address.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address.Address))
+        .Select(address => address.Address.ToString())
+        .Distinct()
+        .ToList();
 }
 
 internal sealed class BridgeService
@@ -374,9 +581,440 @@ internal static class XPlaneParser
     }
 }
 
+// Reads the pilot's latest SimBrief OFP and caches it locally.
+// Endpoint: https://developers.navigraph.com/docs/simbrief/fetching-ofp-data
+// Reading an OFP needs no API key, but the endpoint must only be called in
+// response to a user action (never polled), otherwise the server firewall can
+// ban the client. Results are cached on disk so a restart shows the last route
+// without contacting SimBrief again.
+internal sealed class SimBriefClient
+{
+    private const string DefaultEndpoint = "https://www.simbrief.com/api/xml.fetcher.php";
+    private const int MinimumIntervalMs = 30000;
+    private static readonly string[] LatitudeKeys = ["pos_lat", "lat", "latitude"];
+    private static readonly string[] LongitudeKeys = ["pos_long", "lon", "lng", "longitude"];
+
+    private readonly BridgeConfig config;
+    private readonly string cachePath;
+    private readonly bool persistCache;
+    private readonly FlightPlanHistory? history;
+    private readonly SemaphoreSlim gate = new(1, 1);
+    private JsonObject? plan;
+    private string? planOwner;
+    private long? fetchedAt;
+    private string requestId = "";
+    private string? error;
+    private long lastAttempt;
+    // Raw payload of the last fetch, for the local --dump-ofp diagnostic only.
+    public string? LastRaw { get; private set; }
+
+    public SimBriefClient(BridgeConfig config) : this(config, true) { }
+
+    public SimBriefClient(BridgeConfig config, bool persistCache)
+    {
+        // The settings window edits this same instance, so the user, the endpoint
+        // and the proxy below are read per request and apply without a restart.
+        this.config = config;
+        this.persistCache = persistCache;
+        cachePath = Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "flightplan-cache.json");
+        if (!persistCache) return;
+        history = new FlightPlanHistory(Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "flightplan-history.json"), cachePath);
+        plan = history.ActivePlan(OwnerHash());
+        fetchedAt = history.ActiveFetchedAt(OwnerHash());
+    }
+
+    public bool Configured => config.SimbriefUser.Trim().Length > 0;
+
+    private string Endpoint => config.SimbriefApiUrl.Trim().Length > 0 ? config.SimbriefApiUrl.Trim() : DefaultEndpoint;
+
+    // SHA-256 of the configured account, so the cache file never stores the Pilot ID itself.
+    private string OwnerHash()
+    {
+        var bytes = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(config.SimbriefUser.Trim().ToLowerInvariant()));
+        return Convert.ToHexString(bytes)[..16];
+    }
+
+    public JsonArray HistoryEntries() => history?.List(OwnerHash()) ?? [];
+
+    public string OfpText() => history?.ActiveText(OwnerHash()) ?? "";
+
+    public long? HistoryFetchedAt() => history?.ActiveFetchedAt(OwnerHash()) ?? fetchedAt;
+
+    public string? ActiveId() => history?.ActiveId;
+
+    public string ActiveLabel()
+    {
+        var active = history?.ActivePlan(OwnerHash());
+        return active is null ? "" : FlightPlanHistory.Label(active);
+    }
+
+    public bool SelectHistory(string id)
+    {
+        if (history?.Select(id, OwnerHash()) != true) return false;
+        plan = history.ActivePlan(OwnerHash());
+        fetchedAt = history.ActiveFetchedAt(OwnerHash());
+        planOwner = OwnerHash();
+        error = null;
+        return plan is not null;
+    }
+
+    // Direct connection by default; the proxy is opt-in and can be switched at
+    // any time from the settings window (rebuild when its configuration changes).
+    public async Task<JsonObject> GetAsync(bool refresh, CancellationToken token)
+    {
+        // The account can be changed in the settings window at any time; a plan
+        // that belongs to a different account must never be shown.
+        if (plan is not null && planOwner != OwnerHash())
+        {
+            plan = null;
+            planOwner = null;
+            fetchedAt = null;
+        }
+        if (plan is null && history is not null)
+        {
+            plan = history.ActivePlan(OwnerHash());
+            fetchedAt = history.ActiveFetchedAt(OwnerHash());
+            if (plan is not null) planOwner = OwnerHash();
+        }
+        if (refresh && Configured)
+        {
+            await gate.WaitAsync(token);
+            try
+            {
+                var elapsed = Environment.TickCount64 - lastAttempt;
+                if (elapsed < MinimumIntervalMs)
+                    error = $"请求过于频繁，请 {Math.Ceiling((MinimumIntervalMs - elapsed) / 1000.0)} 秒后重试";
+                else
+                    await FetchAsync(token);
+            }
+            finally { gate.Release(); }
+        }
+        return Status();
+    }
+
+    private async Task FetchAsync(CancellationToken token)
+    {
+        lastAttempt = Environment.TickCount64;
+        var user = config.SimbriefUser.Trim();
+        try
+        {
+            var parameter = IsPilotId(user) ? "userid" : "username";
+            var url = $"{Endpoint}?{parameter}={Uri.EscapeDataString(user)}&json=v2";
+            using var response = await OutboundHttp.SendAsync(OutboundHttp.Global(config), client => client.GetAsync(url, token));
+            var body = await response.Content.ReadAsStringAsync(token);
+            LastRaw = body;
+            JsonNode? payload;
+            try { payload = JsonNode.Parse(body); }
+            catch { throw new InvalidDataException($"SimBrief 返回了无法解析的响应（HTTP {(int)response.StatusCode}）"); }
+            if (!response.IsSuccessStatusCode)
+            {
+                var detail = Child(Child(payload, "fetch"), "status")?.GetValue<string>() ?? $"HTTP {(int)response.StatusCode}";
+                throw new InvalidDataException(detail.StartsWith("Error:") ? detail[6..].Trim() : detail);
+            }
+            JsonObject? parsed;
+            try { parsed = Parse(payload); }
+            catch (Exception shapeError) { throw new InvalidDataException($"SimBrief 响应结构无法识别（{shapeError.Message}）。字段：{Shape(payload)}"); }
+            if (parsed is null)
+            {
+                var routeText = Text(Child(payload, "general"), "route", "route_ifps");
+                throw new InvalidDataException(routeText is null
+                    ? $"SimBrief 响应里没有可用的航路数据。字段：{Shape(payload)}"
+                    : $"SimBrief 计划里只有航路文字、没有航点坐标（可能在 SimBrief 里关闭了 Detailed Navlog）。航路：{Truncate(routeText, 60)}");
+            }
+            plan = parsed;
+            planOwner = OwnerHash();
+            fetchedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            requestId = Text(Child(payload, "params"), "request_id") ?? "";
+            error = null;
+            if (history is not null)
+                history.Add(OwnerHash(), parsed, ExtractOfpText(payload), fetchedAt.Value, requestId, FlightPlanHistory.Label(parsed));
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            error = "SimBrief 请求超时";
+        }
+        catch (Exception cause) when (cause is not OperationCanceledException)
+        {
+            error = cause.Message;
+        }
+    }
+
+    private JsonObject Status() => new()
+    {
+        ["configured"] = Configured,
+        ["available"] = plan is not null,
+        ["fetchedAt"] = fetchedAt ?? HistoryFetchedAt(),
+        ["error"] = error,
+        ["plan"] = plan?.DeepClone()
+    };
+
+    // The complete OFP as readable text: SimBrief delivers it as one big <pre>
+    // block inside text.plan_html, plus a plain text takeoff/landing report.
+    internal static string ExtractOfpText(JsonNode? payload)
+    {
+        var text = Child(payload, "text");
+        var plan = HtmlToText(Text(text, "plan_html") ?? "");
+        var tlr = (Text(text, "tlr_section") ?? "").Trim();
+        var combined = tlr.Length > 0 ? $"{plan}\n\n───── 起降性能报告 ─────\n\n{tlr}" : plan;
+        return combined.Length <= MaxOfpChars ? combined : combined[..MaxOfpChars] + "\n…（内容过长，已截断）";
+    }
+
+    private const int MaxOfpChars = 900_000;
+
+    private static string HtmlToText(string html)
+    {
+        if (html.Length == 0) return "";
+        var text = Regex.Replace(html, "<br\\s*/?>", "\n", RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, "</?(p|div|tr|table|pre|h[1-6])[^>]*>", "\n", RegexOptions.IgnoreCase);
+        text = Regex.Replace(text, "<!--.*?-->", "", RegexOptions.Singleline);
+        text = Regex.Replace(text, "<[^>]+>", "");
+        text = text.Replace("&nbsp;", " ").Replace("&amp;", "&").Replace("&lt;", "<").Replace("&gt;", ">").Replace("&quot;", "\"").Replace("&#39;", "'");
+        text = Regex.Replace(text, "[ \t]+\n", "\n");
+        return Regex.Replace(text, "\n{4,}", "\n\n\n").Trim();
+    }
+
+    private static bool IsPilotId(string value) => value.Length is >= 1 and <= 7 && value.All(char.IsAsciiDigit);
+
+    private static IEnumerable<JsonNode?> AsArray(JsonNode? node)
+    {
+        if (node is JsonArray array) return array;
+        return node is null ? [] : [node];
+    }
+
+    private static double? Number(JsonNode? node)
+    {
+        if (node is not JsonValue value) return null;
+        if (value.TryGetValue<double>(out var number)) return double.IsFinite(number) ? number : null;
+        if (value.TryGetValue<string>(out var text) &&
+            double.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)) return parsed;
+        return null;
+    }
+
+    // SimBrief normally reports decimal degrees but the XML variant also uses
+    // hemisphere prefixes such as "N51.470000".
+    private static double? Coordinate(JsonNode? node)
+    {
+        var direct = Number(node);
+        if (direct is not null) return direct;
+        if (node is not JsonValue value || !value.TryGetValue<string>(out var text)) return null;
+        var trimmed = text.Trim();
+        if (trimmed.Length < 2) return null;
+        var sign = 1;
+        if ("NSEW".Contains(char.ToUpperInvariant(trimmed[0])))
+        {
+            if (char.ToUpperInvariant(trimmed[0]) is 'S' or 'W') sign = -1;
+            trimmed = trimmed[1..].Trim();
+        }
+        else if ("NSEW".Contains(char.ToUpperInvariant(trimmed[^1])))
+        {
+            if (char.ToUpperInvariant(trimmed[^1]) is 'S' or 'W') sign = -1;
+            trimmed = trimmed[..^1].Trim();
+        }
+        return double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? sign * Math.Abs(parsed) : null;
+    }
+
+    private static double? FirstCoordinate(JsonNode? entry, string[] keys)
+    {
+        if (entry is not JsonObject item) return null;
+        foreach (var key in keys)
+        {
+            if (!item.TryGetPropertyValue(key, out var value)) continue;
+            var coordinate = Coordinate(value);
+            if (coordinate is not null) return coordinate;
+        }
+        return null;
+    }
+
+    private static string? Text(JsonNode? entry, params string[] keys)
+    {
+        if (entry is not JsonObject item) return null;
+        foreach (var key in keys)
+        {
+            if (!item.TryGetPropertyValue(key, out var value) || value is null) continue;
+            var text = value.GetValueKind() == JsonValueKind.String ? value.GetValue<string>() : value.ToJsonString();
+            if (!string.IsNullOrWhiteSpace(text)) return text.Trim();
+        }
+        return null;
+    }
+
+    // 0/0 placeholders would stretch the route across the whole world.
+    private static bool Usable(double? latitude, double? longitude) =>
+        latitude is not null && longitude is not null && !(latitude == 0 && longitude == 0);
+
+    private static JsonObject? Waypoint(JsonNode? entry)
+    {
+        var latitude = FirstCoordinate(entry, LatitudeKeys);
+        var longitude = FirstCoordinate(entry, LongitudeKeys);
+        var ident = Text(entry, "ident", "name");
+        if (ident is null || !Usable(latitude, longitude)) return null;
+        var type = (Text(entry, "type") ?? "").ToLowerInvariant();
+        var kind = type.StartsWith("vor") ? "vor" : type.StartsWith("ndb") ? "ndb" : type is "apt" or "airport" or "ad" ? "apt" : "wpt";
+        var altitude = Child(entry, "altitude_feet") ?? Child(entry, "altitude");
+        return new JsonObject
+        {
+            ["ident"] = ident,
+            ["name"] = Text(entry, "name") ?? "",
+            ["type"] = kind,
+            ["via"] = Text(entry, "via_airway", "via") ?? "",
+            ["altitudeFt"] = Number(altitude),
+            ["stage"] = Text(entry, "stage") ?? "",
+            ["lat"] = latitude,
+            ["lon"] = longitude
+        };
+    }
+
+    private static JsonObject? Airport(JsonNode? entry)
+    {
+        var ident = Text(entry, "icao_code", "icao", "iata_code", "ident")?.ToUpperInvariant();
+        if (ident is null) return null;
+        var latitude = FirstCoordinate(entry, LatitudeKeys);
+        var longitude = FirstCoordinate(entry, LongitudeKeys);
+        if (latitude == 0 && longitude == 0) { latitude = null; longitude = null; }
+        return new JsonObject
+        {
+            ["ident"] = ident,
+            ["name"] = Text(entry, "name") ?? "",
+            ["runway"] = Text(entry, "plan_rwy", "runway") ?? "",
+            ["lat"] = latitude,
+            ["lon"] = longitude
+        };
+    }
+
+    private static JsonObject? WithFallback(JsonObject? airport, JsonObject? waypoint)
+    {
+        if (airport is null) return null;
+        if (airport["lat"] is not null && airport["lon"] is not null) return airport;
+        if (waypoint is null) return airport;
+        airport["lat"] = waypoint["lat"]?.DeepClone();
+        airport["lon"] = waypoint["lon"]?.DeepClone();
+        return airport;
+    }
+
+    // Unknown fields are ignored so a SimBrief format change degrades to a
+    // partial route instead of breaking the map.
+    // Reads a child safely. SimBrief sends an empty string for the sections a
+    // pilot has switched off (navlog for example when "Detailed Navlog" is
+    // disabled), and indexing into a non object node throws in System.Text.Json.
+    private static JsonNode? Child(JsonNode? node, string key) =>
+        node is JsonObject item && item.TryGetPropertyValue(key, out var value) ? value : null;
+
+    internal static string Shape(JsonNode? payload) => payload switch
+    {
+        JsonObject root => string.Join(", ", root.Select(item => $"{item.Key}:{Kind(item.Value)}")),
+        null => "空响应",
+        _ => Kind(payload)
+    };
+
+    private static string Kind(JsonNode? node) => node switch
+    {
+        null => "null",
+        JsonObject => "对象",
+        JsonArray array => $"数组({array.Count})",
+        _ => "值"
+    };
+
+    private static string Truncate(string text, int length) =>
+        text.Length <= length ? text : text[..length] + "…";
+
+    // "11:12:53" / "09:47:00" style durations, or a plain number of seconds.
+    private static double? Duration(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var parts = value.Trim().Split(':');
+        if (parts.Length == 1) return Number(JsonValue.Create(value.Trim()));
+        double seconds = 0;
+        foreach (var part in parts)
+        {
+            if (!double.TryParse(part, NumberStyles.Float, CultureInfo.InvariantCulture, out var piece)) return null;
+            seconds = seconds * 60 + piece;
+        }
+        return seconds;
+    }
+
+    // Everything the flight card in the EFB shows. Times stay as the ISO-8601
+    // UTC strings SimBrief sends, so the front end can print them verbatim.
+    private static JsonObject FlightInfo(JsonNode? root)
+    {
+        var general = Child(root, "general");
+        var times = Child(root, "times");
+        var aircraft = Child(root, "aircraft");
+        var airline = Text(general, "icao_airline") ?? "";
+        var number = Text(general, "flight_number") ?? "";
+        var callsign = airline.Length > 0
+            ? number.Length > 0 ? $"{airline}/{number}" : airline
+            : number;
+        return new JsonObject
+        {
+            ["callsign"] = callsign,
+            ["airline"] = airline,
+            ["number"] = number,
+            ["aircraft"] = Text(general, "aircraft_icao") ?? Text(aircraft, "icaocode") ?? "",
+            ["aircraftName"] = Text(aircraft, "name") ?? "",
+            ["registration"] = Text(aircraft, "reg") ?? "",
+            ["plannedOff"] = Text(times, "sched_off") ?? "",
+            ["plannedOn"] = Text(times, "sched_on") ?? "",
+            ["plannedEnrouteSeconds"] = Duration(Text(times, "sched_time_enroute")),
+            ["estimatedOff"] = Text(times, "est_off") ?? "",
+            ["estimatedOn"] = Text(times, "est_on") ?? "",
+            ["estimatedEnrouteSeconds"] = Duration(Text(times, "est_time_enroute")),
+            ["generatedAt"] = Text(Child(root, "params"), "time_generated") ?? ""
+        };
+    }
+
+    internal static JsonObject? Parse(JsonNode? payload)
+    {
+        if (payload is not JsonObject root) return null;
+        // json=v2 returns the fixes as a flat array under "navlog"; the older
+        // shape (and the XML variant) nests them as navlog.fix. Both are accepted.
+        var navlogNode = Child(root, "navlog");
+        var navlog = navlogNode is JsonArray direct ? direct : Child(navlogNode, "fix");
+        var waypoints = new JsonArray();
+        foreach (var item in AsArray(navlog))
+        {
+            var waypoint = Waypoint(item);
+            if (waypoint is not null) waypoints.Add(waypoint);
+        }
+        var alternates = new JsonArray();
+        foreach (var item in AsArray(Child(root, "alternate")))
+        {
+            var alternate = Airport(item);
+            if (alternate is not null) alternates.Add(alternate);
+        }
+        foreach (var item in AsArray(Child(root, "takeoff_altn")))
+        {
+            var alternate = Airport(item);
+            if (alternate is not null) alternates.Add(alternate);
+        }
+        var last = waypoints.Count > 0 ? waypoints[waypoints.Count - 1] as JsonObject : null;
+        var first = waypoints.Count > 0 ? waypoints[0] as JsonObject : null;
+        var origin = WithFallback(Airport(Child(root, "origin")), first);
+        var destination = WithFallback(Airport(Child(root, "destination")), last);
+        var positioned = origin is not null && origin["lat"] is not null && origin["lon"] is not null
+            || destination is not null && destination["lat"] is not null && destination["lon"] is not null;
+        if (waypoints.Count == 0 && !positioned) return null;
+        var general = Child(root, "general");
+        return new JsonObject
+        {
+            ["origin"] = origin,
+            ["destination"] = destination,
+            ["alternates"] = alternates,
+            ["route"] = Text(general, "route", "route_ifps") ?? "",
+            ["aircraft"] = Text(general, "aircraft_icao") ?? Text(Child(root, "aircraft"), "icaocode") ?? "",
+            ["cruiseAltitudeFt"] = Number(Child(general, "initial_altitude") ?? Child(general, "cruise_altitude")),
+            ["distanceNm"] = Number(Child(general, "route_distance") ?? Child(general, "gc_distance")),
+            ["eteSeconds"] = Duration(Text(Child(root, "times"), "est_time_enroute")),
+            ["flight"] = FlightInfo(root),
+            ["waypoints"] = waypoints
+        };
+    }
+}
+
 internal sealed class LocalWebServer
 {
     private readonly BridgeConfig config;
+    private readonly SimBriefClient flightPlan;
+    private readonly WeatherTiles weather = new();
+    private readonly AptDat ground;
     private readonly ConcurrentDictionary<Guid, WebSocket> viewers = new();
     private readonly Channel<string> updates = Channel.CreateBounded<string>(new BoundedChannelOptions(8) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
     private readonly object stateLock = new();
@@ -386,7 +1024,12 @@ internal sealed class LocalWebServer
     private string? lastSender;
     private DateTimeOffset? lastPacketAt;
     public int ViewerCount => viewers.Count;
-    public LocalWebServer(BridgeConfig config) => this.config = config;
+    public LocalWebServer(BridgeConfig config)
+    {
+        this.config = config;
+        flightPlan = new SimBriefClient(config);
+        ground = new AptDat(config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "apt-index.json"));
+    }
 
     public async Task StartAsync(CancellationToken token)
     {
@@ -397,15 +1040,112 @@ internal sealed class LocalWebServer
         app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
         app.MapGet("/api/config", () => Results.Json(new {
             websocketPath = "/ws",
-            authorizedChart = config.AuthorizedChartTileUrl.Length > 0 ? new { name = "Authorized charts", url = config.AuthorizedChartTileUrl, attribution = config.AuthorizedChartAttribution } : null,
             customBaseMap = config.CustomBaseMapUrl.Length > 0 ? new { name = config.CustomBaseMapName.Length > 0 ? config.CustomBaseMapName : "自定义底图", url = config.CustomBaseMapUrl, attribution = config.CustomBaseMapAttribution } : null,
-            navigraphExternalUrl = config.NavigraphExternalUrl,
+            // The API key itself never leaves the PC; the EFB only learns whether
+            // the overlays are configured and which layers exist.
+            weather = new {
+                configured = config.WeatherApiKey.Length > 0,
+                maxZoom = WeatherTiles.MaxZoom,
+                layers = WeatherTiles.Layers.Select(layer => new { name = layer.Name, label = layer.Label })
+            },
+            // Ground layout comes from the local X-Plane installation; the EFB
+            // only needs to know whether it is configured and from which zoom.
+            ground = new { configured = ground.Configured, minZoom = config.GroundMinZoom },
+            airlineLogoUrlTemplate = config.AirlineLogoUrlTemplate,
             local = true
         }));
+        // Ground layout of the airports (apt.dat): nearest to the aircraft.
+        app.MapGet("/api/ground/nearest", (HttpContext context) => {
+            var query = context.Request.Query;
+            var latitude = double.TryParse(query["lat"], NumberStyles.Float, CultureInfo.InvariantCulture, out var lat) ? lat : double.NaN;
+            var longitude = double.TryParse(query["lon"], NumberStyles.Float, CultureInfo.InvariantCulture, out var lon) ? lon : double.NaN;
+            var radius = double.TryParse(query["radius"], NumberStyles.Float, CultureInfo.InvariantCulture, out var r) ? Math.Clamp(r, 1, 40) : 8;
+            JsonObject payload;
+            if (!ground.Configured)
+            {
+                payload = new JsonObject { ["configured"] = false, ["error"] = "未配置 X-Plane 12 安装目录" };
+            }
+            else if (double.IsNaN(latitude) || double.IsNaN(longitude))
+            {
+                payload = new JsonObject { ["configured"] = true, ["error"] = "缺少有效的经纬度" };
+            }
+            else
+            {
+                var data = ground.Nearest(latitude, longitude, radius);
+                payload = data is null
+                    ? new JsonObject { ["configured"] = true, ["airport"] = null }
+                    : new JsonObject { ["configured"] = true, ["airport"] = data };
+            }
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            return context.Response.WriteAsync(payload.ToJsonString(), context.RequestAborted);
+        });
+        app.MapGet("/api/ground/status", (HttpContext context) => {
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            return context.Response.WriteAsync(ground.Status().ToJsonString(), context.RequestAborted);
+        });
+        // OpenWeatherMap overlay tiles, proxied so the key stays on the PC.
+        app.MapGet("/api/weather/tile/{layer}/{z}/{x}/{y}", ServeWeatherTile);
+        // Lets the EFB explain an invisible layer (no data in this area) instead
+        // of leaving the user guessing.
+        app.MapGet("/api/weather/status", (HttpContext context) => {
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            return context.Response.WriteAsync(weather.Status().ToJsonString(), context.RequestAborted);
+        });
+        // Written explicitly rather than through Results.Json: a JsonNode result
+        // is easy to lose in the delegate overloads, and an empty 200 would make
+        // the iPad show a stale cached route without any hint of the failure.
+        app.MapGet("/api/flightplan", async (HttpContext context) => {
+            var query = context.Request.Query;
+            var select = query["select"].ToString();
+            if (select.Length > 0 && !flightPlan.SelectHistory(select))
+            {
+                context.Response.StatusCode = 404;
+                context.Response.ContentType = "application/json; charset=utf-8";
+                await context.Response.WriteAsync("{\"error\":\"找不到这份历史计划\"}", context.RequestAborted);
+                return;
+            }
+            var refresh = query["refresh"].ToString() == "1";
+            var status = await flightPlan.GetAsync(refresh, context.RequestAborted);
+            status["activeId"] = flightPlan.ActiveId();
+            status["historyCount"] = flightPlan.HistoryEntries().Count;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            await context.Response.WriteAsync(status.ToJsonString(), context.RequestAborted);
+        });
+        // Plans the bridge has fetched before can be re-selected without asking
+        // SimBrief again (the public API only ever returns the latest one).
+        app.MapGet("/api/flightplan/history", (HttpContext context) => {
+            var payload = new JsonObject
+            {
+                ["configured"] = flightPlan.Configured,
+                ["activeId"] = flightPlan.ActiveId(),
+                ["entries"] = flightPlan.HistoryEntries()
+            };
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            return context.Response.WriteAsync(payload.ToJsonString(), context.RequestAborted);
+        });
+        // Full OFP text of the active plan, for the viewer inside the EFB.
+        app.MapGet("/api/flightplan/ofp", (HttpContext context) => {
+            var text = flightPlan.OfpText();
+            var payload = new JsonObject
+            {
+                ["available"] = text.Length > 0,
+                ["label"] = flightPlan.ActiveLabel(),
+                ["fetchedAt"] = flightPlan.HistoryFetchedAt(),
+                ["text"] = text
+            };
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            return context.Response.WriteAsync(payload.ToJsonString(), context.RequestAborted);
+        });
         app.MapGet("/api/status", () => {
             Dictionary<string, object> snapshot;
             lock (stateLock) snapshot = new(state);
-            return Results.Json(new { udp = new { ports = config.UdpPorts, sourceIp = config.SourceIp.Length > 0 ? config.SourceIp : null }, stats = new { packets, parsed, lastSender, lastPacketAt }, viewers = viewers.Count, hasPosition = snapshot.ContainsKey("latitude") && snapshot.ContainsKey("longitude") });
+            return Results.Json(new { udp = new { ports = config.UdpPorts, sourceIp = config.SourceIp.Length > 0 ? config.SourceIp : null }, stats = new { packets, parsed, lastSender, lastPacketAt }, viewers = viewers.Count, hasPosition = snapshot.ContainsKey("latitude") && snapshot.ContainsKey("longitude"), simbrief = flightPlan.Configured });
         });
         app.Map("/ws", HandleWebSocket);
         app.MapMethods("/{**path}", ["GET", "HEAD"], ServeEmbedded);
@@ -477,6 +1217,81 @@ internal sealed class LocalWebServer
             }
         }
         catch (OperationCanceledException) { }
+    }
+
+    // Tile URLs end with ".png" (Leaflet templates), so the last coordinate
+    // arrives as "7.png".
+    private static int NumberOf(object? value)
+    {
+        var text = (Convert.ToString(value) ?? "").Trim();
+        var dot = text.IndexOf('.');
+        if (dot >= 0) text = text[..dot];
+        return int.TryParse(text, out var parsed) ? parsed : -1;
+    }
+
+    // OpenWeatherMap overlay tiles, proxied so the API key never leaves the PC.
+    private async Task ServeWeatherTile(HttpContext context)
+    {
+        async Task Fail(int status, string message)
+        {
+            context.Response.StatusCode = status;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            context.Response.Headers.CacheControl = "no-store";
+            await context.Response.WriteAsync($"{{\"error\":\"{message}\"}}", context.RequestAborted);
+        }
+
+        var layer = Convert.ToString(context.Request.RouteValues["layer"]) ?? "";
+        var z = NumberOf(context.Request.RouteValues["z"]);
+        var x = NumberOf(context.Request.RouteValues["x"]);
+        var y = NumberOf(context.Request.RouteValues["y"]);
+        if (!WeatherTiles.ValidCoordinate(layer, z, x, y)) { await Fail(400, "瓦片参数不合法"); return; }
+        var apiKey = config.WeatherApiKey.Trim();
+        if (apiKey.Length == 0) { await Fail(404, "未配置 OpenWeatherMap API Key"); return; }
+
+        var cacheKey = $"{layer}/{z}/{x}/{y}";
+        if (weather.TryGet(cacheKey, out var cached))
+        {
+            await WriteTile(context, cached.Body, cached.ContentType);
+            return;
+        }
+        if (!weather.AllowRequest()) { await Fail(429, "天气瓦片请求过于频繁，请稍后再刷新"); return; }
+
+        try
+        {
+            using var response = await OutboundHttp.SendAsync(
+                OutboundHttp.Weather(config),
+                client => client.GetAsync(WeatherTiles.UpstreamUrl(layer, apiKey, z, x, y), context.RequestAborted));
+            var body = await response.Content.ReadAsByteArrayAsync(context.RequestAborted);
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                await Fail(401, "OpenWeatherMap 拒绝了该 API Key（检查是否填错、或新 Key 还需等待生效）");
+                return;
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                await Fail(502, $"OpenWeatherMap 返回 HTTP {(int)response.StatusCode}");
+                return;
+            }
+            var contentType = response.Content.Headers.ContentType?.MediaType ?? "image/png";
+            weather.Record(layer, body.Length);
+            weather.Store(cacheKey, body, contentType);
+            await WriteTile(context, body, contentType);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception error)
+        {
+            await Fail(502, $"无法连接 OpenWeatherMap：{SecretProtection.Redact(error.Message)}");
+        }
+    }
+
+    private static async Task WriteTile(HttpContext context, byte[] body, string contentType)
+    {
+        context.Response.StatusCode = 200;
+        context.Response.ContentType = contentType;
+        context.Response.ContentLength = body.Length;
+        context.Response.Headers.CacheControl = "public, max-age=300";
+        context.Response.Headers.XContentTypeOptions = "nosniff";
+        await context.Response.Body.WriteAsync(body, context.RequestAborted);
     }
 
     private static readonly Dictionary<string, string> Mime = new(StringComparer.OrdinalIgnoreCase) {

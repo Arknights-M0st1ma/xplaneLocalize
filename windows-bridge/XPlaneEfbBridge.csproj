@@ -12,6 +12,10 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PublishTrimmed>false</PublishTrimmed>
     <AssemblyName>XPlaneEfbBridge</AssemblyName>
+    <Version>0.1.0</Version>
+    <Product>X-Plane EFB Bridge</Product>
+    <Description>局域网 X-Plane 12 便携 EFB 桥接器（UDP → WebSocket + iPad 网页地图）</Description>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <NuGetAudit>false</NuGetAudit>

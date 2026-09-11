@@ -5,6 +5,8 @@ import https from 'node:https';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { config } from './config.js';
+import { createFlightPlanCache } from './simbrief.js';
+import { WEATHER_MAX_ZOOM, createTileCache, upstreamUrl, validCoordinate, weatherLayers } from './weather.js';
 import { XPlaneUdpBridge } from './xplane/udpBridge.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -42,17 +44,19 @@ function serveFile(response, root, relative, cache = false) {
 }
 
 const bridge = new XPlaneUdpBridge({ host: config.udpHost, port: config.udpPort, sourceIp: config.sourceIp });
+const flightPlans = createFlightPlanCache({
+  user: config.simbriefUser,
+  endpoint: config.simbriefEndpoint || undefined
+});
+const weatherTiles = createTileCache();
 const appConfig = {
   websocketPath: '/ws',
-  authorizedChart: config.authorizedTileUrl ? {
-    name: 'Authorized charts', url: config.authorizedTileUrl,
-    attribution: config.authorizedTileAttribution || 'Authorized chart provider'
-  } : null,
   customBaseMap: config.customBaseMapUrl ? {
     name: config.customBaseMapName || '自定义底图', url: config.customBaseMapUrl,
     attribution: config.customBaseMapAttribution || 'Custom map provider'
   } : null,
-  navigraphExternalUrl: config.navigraphExternalUrl,
+  // The API key itself is never sent to the browser.
+  weather: { configured: config.weatherApiKey.length > 0, maxZoom: WEATHER_MAX_ZOOM, layers: weatherLayers() },
   demo: config.demo
 };
 
@@ -60,15 +64,67 @@ const handler = async (request, response) => {
   const url = new URL(request.url, 'http://localhost');
   if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed' });
   if (url.pathname === '/api/config') return sendJson(response, 200, appConfig);
+  if (url.pathname.startsWith('/api/weather/tile/')) return serveWeatherTile(request, response, url);
+  if (url.pathname === '/api/weather/status') return sendJson(response, 200, { layers: weatherTiles.status() });
+  if (url.pathname === '/api/flightplan') {
+    const select = url.searchParams.get('select');
+    if (select && !flightPlans.select(select)) return sendJson(response, 404, { error: '找不到这份历史计划' });
+    const refresh = url.searchParams.get('refresh') === '1';
+    return sendJson(response, 200, await flightPlans.get({ refresh }));
+  }
+  if (url.pathname === '/api/flightplan/history') return sendJson(response, 200, {
+    configured: flightPlans.status().configured,
+    activeId: flightPlans.status().activeId,
+    entries: flightPlans.history()
+  });
+  if (url.pathname === '/api/flightplan/ofp') return sendJson(response, 200, flightPlans.ofp());
   if (url.pathname === '/api/status') return sendJson(response, 200, {
     udp: { host: config.udpHost, port: config.udpPort, sourceIp: config.sourceIp || null },
     stats: bridge.stats,
     hasPosition: Number.isFinite(bridge.state.latitude) && Number.isFinite(bridge.state.longitude),
-    demo: config.demo
+    demo: config.demo,
+    simbrief: flightPlans.status().configured
   });
   const relative = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
   return serveFile(response, publicRoot, relative, url.pathname.startsWith('/vendor/'));
 };
+
+async function serveWeatherTile(request, response, url) {
+  const [, , , , layer, zs, xs, ys] = url.pathname.split('/');
+  // Leaflet templates end with ".png", so the last coordinate is "7.png".
+  const tileNumber = (text) => {
+    const value = Number(String(text ?? '').split('.')[0]);
+    return Number.isInteger(value) ? value : Number.NaN;
+  };
+  const z = tileNumber(zs);
+  const x = tileNumber(xs);
+  const y = tileNumber(ys);
+  const fail = (status, message) => sendJson(response, status, { error: message });
+  if (!validCoordinate(layer, z, x, y)) return fail(400, '瓦片参数不合法');
+  if (config.weatherApiKey.length === 0) return fail(404, '未配置 OpenWeatherMap API Key');
+
+  const key = `${layer}/${z}/${x}/${y}`;
+  const cached = weatherTiles.get(key);
+  if (cached) {
+    response.writeHead(200, { 'Content-Type': cached.contentType, 'Cache-Control': 'public, max-age=300', 'X-Content-Type-Options': 'nosniff' });
+    return response.end(cached.body);
+  }
+  if (!weatherTiles.allow()) return fail(429, '天气瓦片请求过于频繁，请稍后再刷新');
+
+  try {
+    const upstream = await fetch(upstreamUrl(layer, config.weatherApiKey, z, x, y));
+    const body = Buffer.from(await upstream.arrayBuffer());
+    if (upstream.status === 401 || upstream.status === 403) return fail(401, 'OpenWeatherMap 拒绝了该 API Key');
+    if (!upstream.ok) return fail(502, `OpenWeatherMap 返回 HTTP ${upstream.status}`);
+    const contentType = upstream.headers.get('content-type') ?? 'image/png';
+    weatherTiles.record(layer, body.length);
+    weatherTiles.set(key, body, contentType);
+    response.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=300', 'X-Content-Type-Options': 'nosniff' });
+    return response.end(body);
+  } catch (error) {
+    return fail(502, `无法连接 OpenWeatherMap：${error.message}`);
+  }
+}
 
 const tlsEnabled = Boolean(config.tlsCert && config.tlsKey);
 if (Boolean(config.tlsCert) !== Boolean(config.tlsKey)) throw new Error('EFB_TLS_CERT and EFB_TLS_KEY must be set together');

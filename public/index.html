@@ -12,59 +12,161 @@
   <link rel="icon" href="/assets/icon.svg">
   <link rel="apple-touch-icon" href="/assets/icon.svg">
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="/styles.css">
+  <!-- The version query keeps iPad Safari (and the service worker cache) from
+       pairing a freshly fetched index.html with an older app bundle. -->
+  <link rel="stylesheet" href="/styles.css?v=22">
 </head>
 <body>
-  <main id="map" aria-label="Moving map"></main>
+  <!-- The map area shrinks when the sidebar is open, so the sidebar never covers
+       the map and every map gesture keeps working. -->
+  <div id="stage">
+    <div id="mapRotator"><main id="map" aria-label="移动地图"></main></div>
 
-  <header class="topbar glass">
-    <div class="brand"><span class="brand-mark">XP</span><span>PORTABLE EFB</span></div>
-    <div id="status" class="status waiting"><span class="status-dot"></span><span id="statusText">等待数据</span></div>
-    <button id="menuButton" class="icon-button" aria-label="打开图层和设置">☰</button>
-  </header>
+    <header class="topbar glass">
+      <div class="brand"><span class="brand-mark">XP</span><span>PORTABLE EFB</span></div>
+      <div id="status" class="status waiting"><span class="status-dot"></span><span id="statusText">等待数据</span></div>
+      <button id="menuButton" class="icon-button" aria-label="展开或收起侧边栏">☰</button>
+    </header>
 
-  <section class="instruments glass" aria-label="Flight data">
-    <div class="instrument"><span>GS</span><strong id="gs">—</strong><small>KT</small></div>
-    <div class="instrument"><span>ALT</span><strong id="alt">—</strong><small>FT MSL</small></div>
-    <div class="instrument"><span>HDG</span><strong id="hdg">—</strong><small>TRUE</small></div>
-    <div class="instrument optional"><span>V/S</span><strong id="vs">—</strong><small>FPM</small></div>
-  </section>
+    <section class="instruments glass" aria-label="Flight data">
+      <div class="instrument"><span>GS</span><strong id="gs">—</strong><small>KT</small></div>
+      <div class="instrument"><span>ALT</span><strong id="alt">—</strong><small>FT MSL</small></div>
+      <div class="instrument"><span>HDG</span><strong id="hdg">—</strong><small>TRUE</small></div>
+      <div class="instrument optional"><span>V/S</span><strong id="vs">—</strong><small>FPM</small></div>
+    </section>
 
-  <div class="map-actions">
-    <button id="followButton" class="map-button active" aria-pressed="true" title="跟随飞机">⌖<span>跟随</span></button>
-    <button id="headingUpButton" class="map-button" aria-pressed="false" title="让飞机航向始终朝向画面上方">↑<span>航向向上</span></button>
-    <button id="clearTrackButton" class="map-button" title="清除轨迹">↺<span>清轨迹</span></button>
+    <section id="flightOverlay" class="flight-overlay glass" aria-label="航班状态">
+      <header class="fo-head" id="flightDragHandle">
+        <span id="foAirline" class="fo-airline hidden">
+          <img id="foAirlineLogo" class="fo-airline-logo hidden" alt="" loading="lazy">
+          <span id="foAirlineBadge" class="fo-airline-badge">—</span>
+        </span>
+        <span id="foCallsign" class="fo-callsign">—</span>
+        <span id="foAircraft" class="fo-aircraft">—</span>
+        <span class="fo-buttons">
+          <button id="foCollapseButton" class="fo-icon" aria-label="折叠或展开航班状态" title="折叠/展开">▾</button>
+          <button id="foHideButton" class="fo-icon" aria-label="隐藏航班状态" title="隐藏">✕</button>
+        </span>
+      </header>
+      <div class="fo-body">
+        <div class="fo-leg">
+          <div class="leg-end">
+            <span id="foOrigin" class="leg-code">—</span>
+            <span id="foPlannedOff" class="leg-time">—</span>
+            <span class="leg-caption">计划离港 UTC</span>
+          </div>
+          <div class="leg-middle">
+            <span id="foEnroute" class="leg-enroute">—</span>
+            <span class="leg-arrow"></span>
+          </div>
+          <div class="leg-end">
+            <span id="foDestination" class="leg-code">—</span>
+            <span id="foPlannedOn" class="leg-time">—</span>
+            <span class="leg-caption">计划到达 UTC</span>
+          </div>
+        </div>
+        <div class="fo-progress">
+          <span class="fo-bar"><span id="foBarFill"></span></span>
+          <span id="foProgress" class="fo-progress-text">—</span>
+        </div>
+        <dl class="fo-live">
+          <div><dt>剩余距离</dt><dd id="foRemaining">—</dd></div>
+          <div><dt>剩余时间</dt><dd id="foRemainingTime">—</dd></div>
+          <div><dt>预计到达</dt><dd id="foEta">—</dd></div>
+          <div><dt>地速</dt><dd id="foGs">—</dd></div>
+          <div><dt>高度</dt><dd id="foAlt">—</dd></div>
+          <div><dt>航向</dt><dd id="foHdg">—</dd></div>
+          <div><dt>状态</dt><dd id="foPhase">—</dd></div>
+          <div><dt>更新</dt><dd id="foUpdated">—</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <div class="left-controls">
+      <button id="flightRestoreButton" class="weather-icon hidden" aria-label="显示航班状态" title="显示航班状态">✈</button>
+      <button id="groundToggle" class="weather-icon" aria-pressed="false" aria-label="机场地面图层" title="机场地面图层（滑行道/标线/机位）">🛬</button>
+      <div id="weatherSwitcher" class="weather-switcher">
+        <div id="weatherSubIcons" class="weather-sub hidden" role="group" aria-label="天气图层"></div>
+        <button id="weatherToggle" class="weather-main glass" aria-expanded="false" aria-label="天气图层" title="天气图层">☁</button>
+        <label id="weatherOpacityRow" class="weather-opacity hidden" title="天气图层不透明度">
+          <input id="weatherOpacity" type="range" min="30" max="100" step="5" value="85" aria-label="天气图层不透明度">
+        </label>
+      </div>
+      <div class="zoom-control glass">
+        <button id="zoomInButton" type="button" aria-label="放大">＋</button>
+        <button id="zoomOutButton" type="button" aria-label="缩小">－</button>
+      </div>
+    </div>
+
+    <div class="map-actions">
+      <button id="followButton" class="map-button active" aria-pressed="true" title="跟随飞机">⌖<span>跟随</span></button>
+      <button id="headingUpButton" class="map-button" aria-pressed="false" title="让飞机航向始终朝向画面上方">↑<span>航向向上</span></button>
+      <button id="flightToggleButton" class="map-button" aria-pressed="true" title="显示或隐藏航班状态">✈<span>状态</span></button>
+      <button id="clearTrackButton" class="map-button" title="清除轨迹">↺<span>清轨迹</span></button>
+    </div>
+
+    <div id="mapAttribution" class="map-attribution"></div>
   </div>
 
-  <aside id="drawer" class="drawer glass" aria-hidden="true">
-    <div class="drawer-head"><h1>图层与状态</h1><button id="closeButton" class="icon-button" aria-label="关闭">×</button></div>
-    <div class="drawer-section">
-      <h2>底图</h2>
-      <label class="row"><span>OpenStreetMap</span><input type="radio" name="base" value="osm" checked></label>
-      <label id="customBaseMapRow" class="row hidden"><span id="customBaseMapName">自定义底图</span><input type="radio" name="base" value="custom"></label>
-      <label id="authorizedLayerRow" class="row hidden"><span id="authorizedLayerName">授权航图</span><input type="radio" name="base" value="authorized"></label>
-      <p class="section-note">自定义 XYZ 底图须遵守服务商授权条款。</p>
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-head">
+      <h1>图层与状态</h1>
+      <button id="closeButton" class="icon-button" aria-label="收起侧边栏">×</button>
     </div>
-    <div class="drawer-section">
-      <h2>显示</h2>
-      <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
-      <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
+    <div class="sidebar-body">
+      <div class="drawer-section">
+        <h2>底图</h2>
+        <label class="row"><span>OpenStreetMap</span><input type="radio" name="base" value="osm" checked></label>
+        <label id="customBaseMapRow" class="row hidden"><span id="customBaseMapName">自定义底图</span><input type="radio" name="base" value="custom"></label>
+        <label class="row"><span>夜间模式<small>深色底图（仅对底图生效）</small></span><input id="nightToggle" type="checkbox"></label>
+        <p class="section-note">自定义 XYZ 底图需自行获得授权。</p>
+      </div>
+      <div class="drawer-section">
+        <h2>显示</h2>
+        <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
+        <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
+        <label class="row"><span>SimBrief 航路</span><input id="routeToggle" type="checkbox" checked></label>
+      </div>
+      <div class="drawer-section simbrief-card">
+        <h2>SimBrief 航路</h2>
+        <p id="simbriefStatus">尚未获取航路。</p>
+        <div id="planSelectRow" class="field hidden">
+          <select id="planSelect" aria-label="选择已归档的飞行计划"></select>
+        </div>
+        <button id="simbriefRefreshButton" class="primary-button" type="button">获取/刷新航路</button>
+        <button id="ofpButton" class="secondary-button" type="button">查看完整 OFP</button>
+        <dl id="simbriefSummary" class="summary hidden">
+          <dt>备降</dt><dd id="routeAlternates">—</dd>
+          <dt>航路</dt><dd id="routeString">—</dd>
+          <dt>航点</dt><dd id="routeWaypoints">—</dd>
+        </dl>
+      </div>
+      <div class="drawer-section diagnostics">
+        <h2>数据链路</h2>
+        <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
+      </div>
+      <p class="disclaimer">仅用于飞行模拟，不得用于真实导航。</p>
     </div>
-    <div class="drawer-section navigraph-card">
-      <div><h2>Navigraph</h2><p>本项目未调用或转发 Navigraph API。订阅不等于开发者授权；航点叠加与航图嵌入均须经 Navigraph 审核批准。</p></div>
-      <a id="navigraphLink" class="primary-link" target="_blank" rel="noopener noreferrer">打开官方 Charts ↗</a>
-    </div>
-    <div class="drawer-section diagnostics">
-      <h2>数据链路</h2>
-      <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
-    </div>
-    <p class="disclaimer">仅用于飞行模拟，不得用于真实导航。</p>
+    <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-label="调整侧边栏宽度"></div>
   </aside>
+
   <div id="scrim" class="scrim"></div>
   <div id="toast" class="toast" role="status"></div>
 
+  <section id="ofpView" class="ofp-backdrop" aria-hidden="true">
+    <div class="ofp-panel" role="dialog" aria-modal="true" aria-label="飞行计划 OFP">
+      <header class="ofp-head">
+        <div class="ofp-title">
+          <h1>飞行计划 OFP</h1>
+          <p id="ofpMeta" class="section-note">—</p>
+        </div>
+        <button id="ofpCloseButton" class="icon-button" aria-label="关闭 OFP">×</button>
+      </header>
+      <pre id="ofpText"></pre>
+    </div>
+  </section>
+
   <script src="/vendor/leaflet/leaflet.js"></script>
-  <script src="/vendor/leaflet-rotate/leaflet-rotate.umd.min.js"></script>
-  <script type="module" src="/app.js"></script>
+  <script type="module" src="/app.js?v=22"></script>
 </body>
 </html>

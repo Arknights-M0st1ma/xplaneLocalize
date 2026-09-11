@@ -2,10 +2,9 @@
   "UdpPorts": [49000],
   "WebPort": 8080,
   "SourceIp": "",
-  "AuthorizedChartTileUrl": "",
-  "AuthorizedChartAttribution": "",
   "CustomBaseMapName": "",
   "CustomBaseMapUrl": "",
   "CustomBaseMapAttribution": "",
-  "NavigraphExternalUrl": "https://charts.navigraph.com/"
+  "SimbriefUser": "",
+  "SimbriefApiUrl": ""
 }
