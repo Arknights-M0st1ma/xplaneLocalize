@@ -1,3 +1,5 @@
+import { TRACK_OPTIONS, decimateTrack, pruneTrackPoints } from '/track-retention.js';
+
 const $ = (selector) => document.querySelector(selector);
 const RAD = Math.PI / 180;
 const wrap360 = (value) => ((value % 360) + 360) % 360;
@@ -104,21 +106,69 @@ let weatherConfig = null;
 let groundConfig = null;
 
 // ---------------------------------------------------------------- aircraft + track
-const aircraftHtml = `<div class="aircraft-marker"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 3 38 27 59 36 57 42 37 38 35 58 29 58 27 38 7 42 5 36 26 27Z" fill="#f4b860" stroke="#07131b" stroke-width="2.2"/></svg></div>`;
+// Three interchangeable inline SVGs (no extra requests, crisp at every zoom).
+// They are drawn nose-up and rotated with a CSS transform, so the rotation
+// centre is the icon centre and stays exact whatever the map is doing.
+const AIRCRAFT_ICONS = {
+  modern: `<svg viewBox="0 0 64 64" aria-hidden="true">
+      <path d="M32 5.4c2.3 0 3.9 1.9 4.1 4.9l.7 11 16.9 9.1c.9.5 1.5 1.5 1.5 2.5v2.6c0 1.2-1.1 2-2.3 1.7l-16.1-4.3-.8 9.4 6 4.4c.7.5 1.1 1.3 1.1 2.1v1.9c0 1.1-1 2-2.2 1.8l-6.4-1.4-1.4 5.1c-.3 1.2-1.4 2-2.6 2h-.4c-1.2 0-2.3-.8-2.6-2l-1.4-5.1-6.4 1.4c-1.2.2-2.2-.7-2.2-1.8v-1.9c0-.8.4-1.6 1.1-2.1l6-4.4-.8-9.4-16.1 4.3c-1.2.3-2.3-.5-2.3-1.7v-2.6c0-1 .6-2 1.5-2.5l16.9-9.1.7-11c.2-3 1.8-4.9 4.1-4.9z" fill="#f2f7fa" stroke="#0a1620" stroke-width="2.5" stroke-linejoin="round"/>
+      <path d="M32 6.6c1.6 0 2.9 1.4 2.9 3.1v4.6h-5.8v-4.6c0-1.7 1.3-3.1 2.9-3.1z" fill="#55d6be"/>
+      <path d="M27.4 21.6h9.2" stroke="#0a1620" stroke-width="1.6" opacity=".55"/>
+    </svg>`,
+  arrow: `<svg viewBox="0 0 64 64" aria-hidden="true">
+      <path d="M32 3.6 45.9 50.7c.5 1.6-1.3 2.9-2.7 1.8L32 45.2l-11.2 7.3c-1.4 1.1-3.2-.2-2.7-1.8L32 3.6z" fill="#f4b860" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
+      <circle cx="32" cy="31" r="3.2" fill="#0a1620" opacity=".5"/>
+    </svg>`,
+  classic: `<svg viewBox="0 0 64 64" aria-hidden="true">
+      <path d="M32 4 56.5 56.5 32 45.4 7.5 56.5z" fill="#55d6be" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
+      <circle cx="32" cy="36" r="3" fill="#0a1620" opacity=".45"/>
+    </svg>`
+};
+let aircraftIconName = '';
+
+function aircraftHtml() {
+  const name = AIRCRAFT_ICONS[aircraftIconName] ? aircraftIconName : 'modern';
+  return `<div class="aircraft-marker aircraft-${name}">${AIRCRAFT_ICONS[name]}</div>`;
+}
+
 const aircraft = L.marker([0, 0], {
-  icon: L.divIcon({ className: 'aircraft-wrapper', html: aircraftHtml, iconSize: [42, 42], iconAnchor: [21, 21] }),
+  icon: L.divIcon({ className: 'aircraft-wrapper', html: aircraftHtml(), iconSize: [42, 42], iconAnchor: [21, 21] }),
   interactive: false, keyboard: false
 });
+
+function applyAircraftIcon(name, rebuild = true) {
+  aircraftIconName = AIRCRAFT_ICONS[name] ? name : 'modern';
+  store('efb.aircraftIcon', aircraftIconName);
+  const select = $('#aircraftIcon');
+  if (select && select.value !== aircraftIconName) select.value = aircraftIconName;
+  if (!rebuild) return;
+  aircraft.setIcon(L.divIcon({ className: 'aircraft-wrapper', html: aircraftHtml(), iconSize: [42, 42], iconAnchor: [21, 21] }));
+  applyAircraftRotation();
+}
+
+// The track lives in its own canvas pane above the ground layer. A canvas path
+// handles tens of thousands of vertices without the stalls an SVG polyline of
+// the same length would cause on an iPad.
+const trackPane = map.createPane('trackPane');
+trackPane.style.zIndex = '360';
+trackPane.style.pointerEvents = 'none';
+const trackRenderer = L.canvas({ pane: 'trackPane', padding: 0.5 });
 
 // Layered strokes: wide glow, dark casing, bright core. A canvas path cannot use
 // a gradient along its length, so the three strokes provide depth and keep the
 // track readable over bright OSM tiles.
-const trackGlow = L.polyline([], { color: '#55d6be', weight: 15, opacity: 0.1, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackCasing = L.polyline([], { color: '#03161e', weight: 9, opacity: 0.5, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackCore = L.polyline([], { color: '#7ff0d6', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackStart = L.circleMarker([0, 0], { radius: 6, color: '#eaf2f4', weight: 2, fillColor: '#55d6be', fillOpacity: 1, interactive: false });
+const trackGlow = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#55d6be', weight: 15, opacity: 0.1, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackCasing = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#03161e', weight: 9, opacity: 0.5, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackCore = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#7ff0d6', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackStart = L.circleMarker([0, 0], { renderer: trackRenderer, pane: 'trackPane', radius: 6, color: '#eaf2f4', weight: 2, fillColor: '#55d6be', fillOpacity: 1, interactive: false });
 const trackGroup = L.layerGroup([trackGlow, trackCasing, trackCore]).addTo(map);
 let trackStartVisible = false;
+
+// Retention policies live in track-retention.js (pure functions, unit tested).
+let trackOption = 'forever';
+let trackPoints = [];             // { lat, lng, t }
+let trackDirty = false;
+let trackSavedAt = 0;
 
 // ---------------------------------------------------------------- route overlay
 const routeLineGlow = L.polyline([], { color: '#c77dff', weight: 11, opacity: 0.12, lineCap: 'round', dashArray: '1 10', interactive: false });
@@ -130,10 +180,11 @@ const routeLabels = L.layerGroup();
 let routeShown = false;
 let routeWaypoints = [];
 
-// Waypoint names are only useful when zoomed in; below this zoom they would
-// pile up on top of each other, so they are switched off entirely.
-const WAYPOINT_LABEL_MIN_ZOOM = 7;
-const WAYPOINT_LABEL_LIMIT = 45;
+// Names stay useful on a wide view as well, so the floor is deliberately low (5
+// covers a continent). Overlap is handled by the collision filter below instead
+// of by hiding every name.
+const WAYPOINT_LABEL_MIN_ZOOM = 5;
+const WAYPOINT_LABEL_LIMIT = 90;
 const labelPool = [];
 let labelKey = "";
 
@@ -256,28 +307,56 @@ function updateWaypointLabels() {
   labelKey = key;
 
   const size = map.getSize();
-  const bounds = map.getBounds().pad(0.15);
+  const bounds = map.getBounds().pad(0.12);
+  const zoom = map.getZoom();
+  const fontPx = zoom <= 6 ? 12 : 14;
+  // Radio navaids first (they are what you read on a wide view), then the fixes
+  // closest to the middle of the screen.
+  const rank = (waypoint) => (waypoint.type === 'vor' || waypoint.type === 'ndb' ? 0 : 1);
   const candidates = [];
   for (const waypoint of routeWaypoints) {
     if (!bounds.contains([waypoint.lat, waypoint.lon])) continue;
     const point = map.latLngToContainerPoint([waypoint.lat, waypoint.lon]);
-    candidates.push({ waypoint, point, distance: Math.hypot(point.x - size.x / 2, point.y - size.y / 2) });
+    candidates.push({
+      waypoint,
+      point,
+      rank: rank(waypoint),
+      distance: Math.hypot(point.x - size.x / 2, point.y - size.y / 2)
+    });
   }
-  candidates.sort((a, b) => a.distance - b.distance);
+  candidates.sort((a, b) => a.rank - b.rank || a.distance - b.distance);
 
+  const aircraftPoint = map.hasLayer(aircraft) ? map.latLngToContainerPoint(aircraft.getLatLng()) : null;
   ensureLabelPool(WAYPOINT_LABEL_LIMIT);
   const placed = [];
   let used = 0;
   for (const candidate of candidates) {
     if (used >= WAYPOINT_LABEL_LIMIT) break;
-    // Cheap collision filter: keep names that are at least one label apart.
-    if (placed.some((point) => Math.abs(point.x - candidate.point.x) < 64 && Math.abs(point.y - candidate.point.y) < 26)) continue;
-    placed.push(candidate.point);
+    const label = candidate.waypoint.ident ?? '';
+    // Rectangle sized from the real text, so short idents do not waste space and
+    // long ones cannot collide with their neighbour.
+    const width = 14 + label.length * fontPx * 0.62;
+    const height = fontPx + 12;
+    const box = {
+      x1: candidate.point.x - width / 2,
+      x2: candidate.point.x + width / 2,
+      y1: candidate.point.y - height / 2,
+      y2: candidate.point.y + height / 2
+    };
+    // Never put a name on top of the aircraft icon.
+    if (aircraftPoint
+      && Math.abs(aircraftPoint.x - candidate.point.x) < width / 2 + 24
+      && Math.abs(aircraftPoint.y - candidate.point.y) < height / 2 + 22) continue;
+    if (placed.some((other) => box.x1 < other.x2 + 3 && other.x1 < box.x2 + 3 && box.y1 < other.y2 + 3 && other.y1 < box.y2 + 3)) continue;
+    placed.push(box);
     const marker = labelPool[used++];
     marker.setLatLng([candidate.waypoint.lat, candidate.waypoint.lon]);
     routeLabels.addLayer(marker);
     const element = marker.getElement()?.firstElementChild;
-    if (element) element.textContent = candidate.waypoint.ident;
+    if (element) {
+      element.textContent = label;
+      element.style.fontSize = `${fontPx}px`;
+    }
   }
   for (let index = used; index < labelPool.length; index++) routeLabels.removeLayer(labelPool[index]);
 }
@@ -314,18 +393,142 @@ function distanceMeters(a, b) {
   return Math.sqrt(dLat * dLat + x * x) * 6371000;
 }
 
+// Points are buffered and drawn at most a few times per second: the telemetry
+// arrives at 5-10 Hz and redrawing the whole polyline on every packet is what
+// makes long tracks feel sluggish.
 function pushTrackPoint(position) {
-  const points = trackCore.getLatLngs();
-  points.push(position);
-  if (points.length > 2000) points.splice(0, points.length - 2000);
-  trackCore.setLatLngs(points);
-  trackCasing.setLatLngs(points);
-  trackGlow.setLatLngs(points);
-  if (!trackStartVisible) {
-    trackStart.setLatLng(points[0]);
-    trackGroup.addLayer(trackStart);
-    trackStartVisible = true;
+  trackPoints.push({ lat: position[0], lng: position[1], t: Date.now() });
+  trackDirty = true;
+}
+
+function pruneTrack() {
+  trackPoints = pruneTrackPoints(trackPoints, trackOption);
+}
+
+function renderTrack() {
+  const latlngs = trackPoints.map((point) => [point.lat, point.lng]);
+  trackCore.setLatLngs(latlngs);
+  trackCasing.setLatLngs(latlngs);
+  // The wide glow is the most expensive stroke, so it is dropped on very long
+  // tracks where the casing already provides the contrast.
+  const wantGlow = latlngs.length <= 12000;
+  if (wantGlow && !trackGroup.hasLayer(trackGlow)) trackGroup.addLayer(trackGlow);
+  if (!wantGlow && trackGroup.hasLayer(trackGlow)) trackGroup.removeLayer(trackGlow);
+  if (wantGlow) trackGlow.setLatLngs(latlngs);
+  if (latlngs.length > 0) {
+    trackStart.setLatLng(latlngs[0]);
+    if (!trackStartVisible) {
+      trackGroup.addLayer(trackStart);
+      trackStartVisible = true;
+    }
+  } else if (trackStartVisible) {
+    trackGroup.removeLayer(trackStart);
+    trackStartVisible = false;
   }
+  updateTrackSummary();
+}
+
+function formatSpan(milliseconds) {
+  const total = Math.max(0, Math.round(milliseconds / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return `${hours} 小时 ${String(minutes).padStart(2, '0')} 分`;
+  if (minutes > 0) return `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`;
+  return `${seconds} 秒`;
+}
+
+function updateTrackSummary() {
+  const node = $('#trackSummary');
+  if (!node) return;
+  if (trackPoints.length === 0) {
+    node.textContent = '轨迹为空，清轨迹按钮可随时清空。';
+    return;
+  }
+  const span = trackPoints[trackPoints.length - 1].t - trackPoints[0].t;
+  const hidden = map.hasLayer(trackGroup) ? '' : '（轨迹已隐藏）';
+  node.textContent = `已记录 ${trackPoints.length.toLocaleString('en-US')} 个点 · 跨度 ${formatSpan(span)}${hidden}`;
+}
+
+function flushTrack() {
+  if (!trackDirty) return;
+  trackDirty = false;
+  pruneTrack();
+  renderTrack();
+  maybeSaveTrack();
+}
+
+function clearTrack() {
+  trackPoints = [];
+  trackDirty = false;
+  lastTrackPoint = null;
+  renderTrack();
+  try { localStorage.removeItem('efb.track'); } catch { /* private mode */ }
+  showToast('轨迹已清除');
+}
+
+// The track is also kept in localStorage so "永久保留" survives a reload. The
+// payload is trimmed rather than dropped when it gets big, and any storage error
+// simply disables persistence for the session.
+let trackPersistDisabled = false;
+
+function maybeSaveTrack(force = false) {
+  if (trackPersistDisabled) return;
+  const now = Date.now();
+  if (!force && now - trackSavedAt < 12000) return;
+  trackSavedAt = now;
+  try {
+    let points = trackPoints;
+    let payload = '';
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      payload = JSON.stringify(points.map((point) => [
+        Math.round(point.lat * 1e5) / 1e5,
+        Math.round(point.lng * 1e5) / 1e5,
+        Math.round(point.t / 1000)
+      ]));
+      if (payload.length <= 1200000) break;
+      points = decimateTrack(points, Math.floor(points.length / 2));
+    }
+    if (payload.length > 1200000) { trackPersistDisabled = true; return; }
+    localStorage.setItem('efb.track', payload);
+  } catch { trackPersistDisabled = true; }
+}
+
+function restoreTrack() {
+  try {
+    const raw = localStorage.getItem('efb.track');
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    trackPoints = parsed
+      .filter((point) => Array.isArray(point) && point.length >= 3 && Number.isFinite(point[0]) && Number.isFinite(point[1]))
+      .map((point) => ({ lat: point[0], lng: point[1], t: point[2] * 1000 }));
+    pruneTrack();
+    renderTrack();
+  } catch { /* a corrupt entry must never stop the map from loading */ }
+}
+
+function setTrackOption(value) {
+  trackOption = TRACK_OPTIONS[value] ? value : 'forever';
+  store('efb.trackOption', trackOption);
+  const select = $('#trackOption');
+  if (select && select.value !== trackOption) select.value = trackOption;
+  pruneTrack();
+  renderTrack();
+  maybeSaveTrack(true);
+}
+
+function initTrack() {
+  // Restore before anything can write: applying the option at start-up used to
+  // save an empty track over the stored one, so "永久保留" was lost on reload.
+  const stored = readStored('efb.trackOption');
+  trackOption = TRACK_OPTIONS[stored] ? stored : 'forever';
+  const select = $('#trackOption');
+  if (select) select.value = trackOption;
+  restoreTrack();
+  setInterval(flushTrack, 400);
+  setInterval(() => maybeSaveTrack(), 15000);
+  window.addEventListener('pagehide', () => maybeSaveTrack(true));
 }
 
 function updateTelemetry(data) {
@@ -573,16 +776,14 @@ $('#followButton').addEventListener('click', () => setFollow(!follow));
 $('#headingUpButton').addEventListener('click', () => setHeadingUp(!headingUp));
 $('#zoomInButton').addEventListener('click', () => map.zoomIn());
 $('#zoomOutButton').addEventListener('click', () => map.zoomOut());
-$('#clearTrackButton').addEventListener('click', () => {
-  trackCore.setLatLngs([]);
-  trackCasing.setLatLngs([]);
-  trackGlow.setLatLngs([]);
-  trackGroup.removeLayer(trackStart);
-  trackStartVisible = false;
-  lastTrackPoint = null;
-  showToast('轨迹已清除');
+$('#clearTrackButton').addEventListener('click', () => clearTrack());
+$('#trackToggle').addEventListener('change', (event) => {
+  if (event.target.checked) trackGroup.addTo(map);
+  else trackGroup.removeFrom(map);
+  updateTrackSummary();
 });
-$('#trackToggle').addEventListener('change', (event) => event.target.checked ? trackGroup.addTo(map) : trackGroup.removeFrom(map));
+$('#trackOption').addEventListener('change', (event) => setTrackOption(event.target.value));
+$('#aircraftIcon').addEventListener('change', (event) => applyAircraftIcon(event.target.value));
 $('#aircraftToggle').addEventListener('change', (event) => event.target.checked ? aircraft.addTo(map) : aircraft.removeFrom(map));
 $('#routeToggle').addEventListener('change', (event) => setRouteVisible(event.target.checked));
 $('#simbriefRefreshButton').addEventListener('click', () => loadFlightPlan(true));
@@ -1173,6 +1374,8 @@ async function bootstrap() {
   renderAttribution();
   markBaseLayer();
   layoutRotator();
+  initTrack();
+  applyAircraftIcon(readStored('efb.aircraftIcon') || 'modern');
   applyNightMode(readStored('efb.nightMode') === '1');
   setSidebarWidth(Number(readStored('efb.sidebarWidth')) || 380);
   setSidebar(readStored('efb.sidebarOpen') === '1');

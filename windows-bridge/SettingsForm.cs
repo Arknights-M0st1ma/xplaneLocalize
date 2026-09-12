@@ -872,16 +872,17 @@ internal sealed class SettingsForm : Form
             return;
         }
         testRoute.Enabled = false;
-        testResult.Text = "正在向 SimBrief 请求…";
+        testResult.Text = $"正在向 SimBrief 请求…（{OutboundHttp.DescribeEffective(OutboundHttp.Global(probe))}）";
         try
         {
             var client = new SimBriefClient(probe, persistCache: false);
             var status = await client.GetAsync(refresh: true, CancellationToken.None);
             var plan = status["plan"] as System.Text.Json.Nodes.JsonObject;
             var available = status["available"]?.GetValue<bool>() == true && plan is not null;
+            var route = OutboundHttp.DescribeEffective(OutboundHttp.Global(probe));
             if (!available)
             {
-                testResult.Text = $"获取失败：{status["error"]?.GetValue<string>() ?? "未知错误"}";
+                testResult.Text = $"获取失败：{status["error"]?.GetValue<string>() ?? "未知错误"}（{route}）";
             }
             else
             {
@@ -890,13 +891,13 @@ internal sealed class SettingsForm : Form
                 var count = (plan["waypoints"] as System.Text.Json.Nodes.JsonArray)?.Count ?? 0;
                 var distance = plan["distanceNm"]?.GetValue<double?>();
                 testResult.Text = count > 0
-                    ? $"成功：{origin} → {destination}，{count} 个航点{(distance is > 0 ? $"，{Math.Round(distance.Value)} NM" : "")}。点“保存”后 iPad 上会显示这条航路。"
-                    : $"成功，但这份计划里没有航点明细，只会显示 {origin} → {destination} 的直连线。要显示完整航路，请在 SimBrief 里启用 Detailed Navlog（详细航路日志）后重新生成计划，再回来测试。";
+                    ? $"成功：{origin} → {destination}，{count} 个航点{(distance is > 0 ? $"，{Math.Round(distance.Value)} NM" : "")}（{route}）。点“保存”后 iPad 上会显示这条航路。"
+                    : $"成功，但这份计划里没有航点明细，只会显示 {origin} → {destination} 的直连线。要显示完整航路，请在 SimBrief 里启用 Detailed Navlog（详细航路日志）后重新生成计划，再回来测试。（{route}）";
             }
         }
         catch (Exception error)
         {
-            testResult.Text = $"测试失败：{error.Message}";
+            testResult.Text = $"测试失败：{OutboundHttp.Explain(error, OutboundHttp.Global(probe))}";
         }
         finally
         {

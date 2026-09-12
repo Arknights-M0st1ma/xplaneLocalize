@@ -314,6 +314,71 @@ internal static class ConfigSelfTest
         catch { disposedOk = false; }
         Check("被外部释放后仍能自动恢复", disposedOk);
 
+        // 13b. Outbound HTTP: the proxy that is actually in effect must be
+        // reported, and a connection that fails once must be retried.
+        static int StartFlakyServer(int failures)
+        {
+            var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((System.Net.IPEndPoint)listener.LocalEndpoint!).Port;
+            _ = Task.Run(async () =>
+            {
+                var failed = 0;
+                try
+                {
+                    while (true)
+                    {
+                        using var socket = await listener.AcceptTcpClientAsync();
+                        using var stream = socket.GetStream();
+                        _ = await stream.ReadAsync(new byte[2048]);
+                        if (failed < failures)
+                        {
+                            // Dropping without answering is what a proxy that is
+                            // still starting up looks like to HttpClient.
+                            failed += 1;
+                            continue;
+                        }
+                        var body = System.Text.Encoding.ASCII.GetBytes("ok");
+                        var head = System.Text.Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+                        await stream.WriteAsync(head);
+                        await stream.WriteAsync(body);
+                        await stream.FlushAsync();
+                        break;
+                    }
+                }
+                catch { }
+                try { listener.Stop(); } catch { }
+            });
+            return port;
+        }
+
+        var noneChoice = new ProxyChoice(BridgeConfig.ProxyNone, "", "", "");
+        Check("代理描述：直连", OutboundHttp.DescribeEffective(noneChoice) == "不使用代理（直连）");
+        Check("代理描述：自定义代理只显示主机与端口",
+            OutboundHttp.DescribeEffective(new ProxyChoice(BridgeConfig.ProxyManual, "http://127.0.0.1:7890", "", "")).Contains("127.0.0.1:7890"));
+        Check("代理描述：系统代理不会抛异常",
+            OutboundHttp.DescribeEffective(new ProxyChoice(BridgeConfig.ProxySystem, "", "", "")).StartsWith("系统代理"),
+            OutboundHttp.DescribeEffective(new ProxyChoice(BridgeConfig.ProxySystem, "", "", "")));
+        Check("错误说明附带实际出口",
+            OutboundHttp.Explain(new HttpRequestException("boom"), noneChoice).Contains("当前走："));
+        Check("DNS 失败给出可读原因",
+            OutboundHttp.Explain(new HttpRequestException("x", new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.HostNotFound)), noneChoice).Contains("域名解析失败"));
+
+        var flakyPort = StartFlakyServer(failures: 1);
+        var retried = false;
+        try
+        {
+            using var response = OutboundHttp.SendAsync(
+                noneChoice,
+                TimeSpan.FromSeconds(10),
+                attempts: 2,
+                (client, deadline) => client.GetAsync($"http://127.0.0.1:{flakyPort}/retry", deadline),
+                CancellationToken.None).GetAwaiter().GetResult();
+            retried = response.IsSuccessStatusCode;
+        }
+        catch { retried = false; }
+        Check("首次连接失败后自动重试成功", retried);
+
         // 14. apt.dat ground layout (synthetic file in the X-Plane directory layout).
         var xplaneRoot = Path.Combine(directory, "xplane");
         var aptDirectory = Path.Combine(xplaneRoot, "Resources", "default scenery", "default apt dat", "Earth nav data");

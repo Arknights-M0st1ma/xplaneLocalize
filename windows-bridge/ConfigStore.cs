@@ -72,8 +72,15 @@ internal static class ConfigStore
 
     public static string DirectoryFor(string path) => Path.GetDirectoryName(path) ?? ".";
 
+    // The configuration this process is actually running on. Cache files (the
+    // SimBrief history, the airport index) live next to it, so running a second
+    // configuration - a test fixture or --headless <other.json> - stays
+    // self-contained instead of mixing its data into the user's real folder.
+    public static string ActivePath { get; private set; } = DefaultPath;
+
     public static ConfigSnapshot Load(string path)
     {
+        ActivePath = path;
         Directory.CreateDirectory(DirectoryFor(path));
         if (!File.Exists(path))
         {

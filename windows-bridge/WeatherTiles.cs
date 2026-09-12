@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Text.Json.Nodes;
 
 namespace XPlaneEfbBridge;
@@ -41,6 +43,47 @@ internal static class OutboundHttp
         config.WeatherProxyUser,
         SecretProtection.Unprotect(config.WeatherProxyPassword));
 
+    // The proxy a request would actually go through, for logs and error messages.
+    // Never includes credentials.
+    public static string DescribeEffective(ProxyChoice choice) => choice.Mode switch
+    {
+        BridgeConfig.ProxySystem => SystemProxy.Shared.Describe(),
+        BridgeConfig.ProxyManual => DescribeManual(choice.Url),
+        _ => "不使用代理（直连）"
+    };
+
+    private static string DescribeManual(string url)
+    {
+        if (url.Length == 0) return "自定义代理（未填地址，等同直连）";
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? $"自定义代理 {uri.Host}:{uri.Port}" : "自定义代理（地址无法解析）";
+    }
+
+    // Turns a transport exception into something the user can act on, plus the
+    // proxy that was in effect (the usual reason "the browser works but the exe
+    // times out" is that the two are not using the same route).
+    public static string Explain(Exception cause, ProxyChoice choice)
+    {
+        var inner = cause is AggregateException aggregate ? aggregate.GetBaseException() : cause;
+        var socket = inner as SocketException ?? inner.InnerException as SocketException;
+        var text = socket?.SocketErrorCode switch
+        {
+            SocketError.HostNotFound or SocketError.NoData => "域名解析失败（DNS）",
+            SocketError.ConnectionRefused => "连接被拒绝（对端或代理端口没有监听）",
+            SocketError.TimedOut => "连接超时",
+            SocketError.NetworkUnreachable or SocketError.HostUnreachable => "网络不可达",
+            SocketError.ConnectionReset => "连接被重置",
+            _ => null
+        };
+        text ??= inner switch
+        {
+            TaskCanceledException or TimeoutException => "请求超时",
+            AuthenticationException => "TLS/证书校验失败",
+            HttpRequestException http => $"HTTP 请求失败：{SecretProtection.Redact(http.Message)}",
+            _ => SecretProtection.Redact(inner.Message)
+        };
+        return $"{text}｜当前走：{DescribeEffective(choice)}";
+    }
+
     public static HttpClient For(ProxyChoice choice)
     {
         lock (Gate)
@@ -75,24 +118,66 @@ internal static class OutboundHttp
     // Single entry point for outbound calls: keeps the client alive across
     // requests and retries once with a clean client if it was disposed.
     public static async Task<HttpResponseMessage> SendAsync(ProxyChoice choice, Func<HttpClient, Task<HttpResponseMessage>> send)
+        => await SendAsync(choice, DefaultTimeout, 1, (client, _) => send(client));
+
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
+
+    // Every attempt gets its own deadline, so a slow but working download is not
+    // cut off at the same second as a dead connection, and the caller's token
+    // still aborts immediately (an iPad that closed the page must not keep the
+    // request alive). Transient transport failures are retried with a short
+    // backoff; the caller's own cancellation is never retried.
+    public static async Task<HttpResponseMessage> SendAsync(
+        ProxyChoice choice,
+        TimeSpan timeout,
+        int attempts,
+        Func<HttpClient, CancellationToken, Task<HttpResponseMessage>> send,
+        CancellationToken token = default)
     {
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            return await send(For(choice));
-        }
-        catch (ObjectDisposedException)
-        {
-            return await send(Rebuild(choice));
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+            deadline.CancelAfter(timeout);
+            try
+            {
+                return await send(For(choice), deadline.Token);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw; // the caller went away: no retry, no error report
+            }
+            catch (ObjectDisposedException)
+            {
+                // A disposed shared client is a caller bug, not a network
+                // failure: rebuilding is cheap, so this always gets one extra
+                // recovery attempt even when the caller asked for no retries.
+                _ = Rebuild(choice);
+                if (attempt >= attempts + 1) throw;
+            }
+            catch (Exception)
+            {
+                if (attempt >= attempts) throw;
+            }
+            await Task.Delay(TimeSpan.FromMilliseconds(350 * attempt), token);
         }
     }
 
     private static HttpClient Build(ProxyChoice choice)
     {
-        var handler = new HttpClientHandler { UseProxy = false };
+        var handler = new HttpClientHandler
+        {
+            UseProxy = false,
+            // SimBrief's responses are large and compress well; without this the
+            // transfer is several times bigger than it needs to be.
+            AutomaticDecompression = DecompressionMethods.All,
+            // Corporate/NTLM proxies (and local proxies that ask for auth) need
+            // the Windows identity of the user running the bridge.
+            DefaultProxyCredentials = CredentialCache.DefaultCredentials
+        };
         if (choice.Mode == BridgeConfig.ProxySystem)
         {
             handler.UseProxy = true;
-            handler.Proxy = WebRequest.GetSystemWebProxy();
+            handler.Proxy = SystemProxy.Shared;
         }
         else if (choice.Mode == BridgeConfig.ProxyManual && choice.Url.Length > 0)
         {
@@ -102,7 +187,67 @@ internal static class OutboundHttp
                 proxy.Credentials = new NetworkCredential(choice.User, choice.Password);
             handler.Proxy = proxy;
         }
-        return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
+        // The per-attempt deadline is the real limit; HttpClient's own timeout
+        // would apply to the whole (possibly retried) operation instead.
+        return new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+    }
+
+    // Windows proxy settings can change while the bridge keeps running (Clash and
+    // friends toggle them), and a WebProxy resolved once and cached forever was
+    // exactly why "the browser can reach SimBrief but the exe times out". This
+    // wrapper re-reads them every so often and also honours the conventional
+    // HTTPS_PROXY/HTTP_PROXY environment variables when Windows has none.
+    internal sealed class SystemProxy : IWebProxy
+    {
+        private static readonly TimeSpan Ttl = TimeSpan.FromSeconds(45);
+        private readonly object gate = new();
+        private IWebProxy resolved = new WebProxy();
+        private DateTimeOffset resolvedAt = DateTimeOffset.MinValue;
+
+        public static SystemProxy Shared { get; } = new();
+
+        public ICredentials? Credentials { get; set; }
+
+        public Uri? GetProxy(Uri destination) => Current().GetProxy(destination);
+
+        public bool IsBypassed(Uri host)
+        {
+            try { return Current().IsBypassed(host); }
+            catch { return true; }
+        }
+
+        public string Describe()
+        {
+            try
+            {
+                var probe = new Uri("https://www.simbrief.com/");
+                var proxy = Current().GetProxy(probe);
+                if (proxy is null || proxy.Host.Length == 0 || proxy == probe) return "系统代理未配置（直连）";
+                return $"系统代理 {proxy.Host}:{proxy.Port}";
+            }
+            catch { return "系统代理（无法读取）"; }
+        }
+
+        private IWebProxy Current()
+        {
+            lock (gate)
+            {
+                if (DateTimeOffset.UtcNow - resolvedAt < Ttl) return resolved;
+                resolved = Resolve();
+                resolvedAt = DateTimeOffset.UtcNow;
+                return resolved;
+            }
+        }
+
+        private static IWebProxy Resolve()
+        {
+            var configured = Environment.GetEnvironmentVariable("HTTPS_PROXY") ?? Environment.GetEnvironmentVariable("https_proxy")
+                ?? Environment.GetEnvironmentVariable("HTTP_PROXY") ?? Environment.GetEnvironmentVariable("http_proxy");
+            if (!string.IsNullOrWhiteSpace(configured) && Uri.TryCreate(configured.Trim(), UriKind.Absolute, out var uri))
+                return new WebProxy(uri);
+            try { return WebRequest.GetSystemWebProxy(); }
+            catch { return new WebProxy(); }
+        }
     }
 
     private static void ScheduleDispose(HttpClient client)

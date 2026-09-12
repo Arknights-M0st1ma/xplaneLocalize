@@ -14,7 +14,7 @@
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
   <!-- The version query keeps iPad Safari (and the service worker cache) from
        pairing a freshly fetched index.html with an older app bundle. -->
-  <link rel="stylesheet" href="/styles.css?v=24">
+  <link rel="stylesheet" href="/styles.css?v=25">
 </head>
 <body>
   <!-- The map area shrinks when the sidebar is open, so the sidebar never covers
@@ -126,6 +126,26 @@
         <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
         <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
         <label class="row"><span>SimBrief 航路</span><input id="routeToggle" type="checkbox" checked></label>
+        <div class="field">
+          <span class="field-caption">飞机图标</span>
+          <select id="aircraftIcon" aria-label="飞机图标样式">
+            <option value="modern">现代客机（默认）</option>
+            <option value="arrow">简约箭头</option>
+            <option value="classic">经典三角</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-caption">航迹保留</span>
+          <select id="trackOption" aria-label="航迹保留策略">
+            <option value="forever">永久保留（自动抽稀）</option>
+            <option value="hours6">最近 6 小时</option>
+            <option value="hours1">最近 1 小时</option>
+            <option value="points50000">最近 50 000 个点</option>
+            <option value="points10000">最近 10 000 个点</option>
+            <option value="points2000">最近 2 000 个点</option>
+          </select>
+        </div>
+        <p id="trackSummary" class="section-note">—</p>
       </div>
       <div class="drawer-section simbrief-card">
         <h2>SimBrief 航路</h2>
@@ -167,6 +187,6 @@
   </section>
 
   <script src="/vendor/leaflet/leaflet.js"></script>
-  <script type="module" src="/app.js?v=24"></script>
+  <script type="module" src="/app.js?v=25"></script>
 </body>
 </html>

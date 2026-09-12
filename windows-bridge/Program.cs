@@ -633,9 +633,9 @@ internal sealed class SimBriefClient
         // and the proxy below are read per request and apply without a restart.
         this.config = config;
         this.persistCache = persistCache;
-        cachePath = Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "flightplan-cache.json");
+        cachePath = Path.Combine(ConfigStore.DirectoryFor(ConfigStore.ActivePath), "flightplan-cache.json");
         if (!persistCache) return;
-        history = new FlightPlanHistory(Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "flightplan-history.json"), cachePath);
+        history = new FlightPlanHistory(Path.Combine(ConfigStore.DirectoryFor(ConfigStore.ActivePath), "flightplan-history.json"), cachePath);
         plan = history.ActivePlan(OwnerHash());
         fetchedAt = history.ActiveFetchedAt(OwnerHash());
     }
@@ -713,11 +713,23 @@ internal sealed class SimBriefClient
     {
         lastAttempt = Environment.TickCount64;
         var user = config.SimbriefUser.Trim();
+        // Read per request: the settings window can change the proxy while the
+        // bridge keeps running, and the answer has to use the new one right away.
+        var choice = OutboundHttp.Global(config);
         try
         {
             var parameter = IsPilotId(user) ? "userid" : "username";
             var url = $"{Endpoint}?{parameter}={Uri.EscapeDataString(user)}&json=v2";
-            using var response = await OutboundHttp.SendAsync(OutboundHttp.Global(config), client => client.GetAsync(url, token));
+            // SimBrief answers with the whole OFP (several hundred KB, plan_html
+            // included), so the deadline is generous and one retry is worth it:
+            // a proxy that is still starting up would otherwise fail the request
+            // outright.
+            using var response = await OutboundHttp.SendAsync(
+                choice,
+                TimeSpan.FromSeconds(35),
+                attempts: 2,
+                (client, deadline) => client.GetAsync(url, deadline),
+                token);
             var body = await response.Content.ReadAsStringAsync(token);
             LastRaw = body;
             JsonNode? payload;
@@ -748,11 +760,11 @@ internal sealed class SimBriefClient
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
-            error = "SimBrief 请求超时";
+            error = $"SimBrief 请求超时（{OutboundHttp.DescribeEffective(choice)}）";
         }
         catch (Exception cause) when (cause is not OperationCanceledException)
         {
-            error = cause.Message;
+            error = OutboundHttp.Explain(cause, choice);
         }
     }
 
@@ -1048,7 +1060,7 @@ internal sealed class LocalWebServer
         flightPlan = new SimBriefClient(config);
         // Reads config.XplanePath on every lookup, so changing the X-Plane folder
         // in the settings window takes effect without restarting the service.
-        ground = new AptDat(() => config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.DefaultPath), "apt-index.json"));
+        ground = new AptDat(() => config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.ActivePath), "apt-index.json"));
     }
 
     public async Task StartAsync(CancellationToken token)
@@ -1414,7 +1426,10 @@ internal sealed class LocalWebServer
         {
             using var response = await OutboundHttp.SendAsync(
                 OutboundHttp.Weather(config),
-                client => client.GetAsync(WeatherTiles.UpstreamUrl(layer, apiKey, z, x, y), context.RequestAborted));
+                TimeSpan.FromSeconds(20),
+                attempts: 2,
+                (client, deadline) => client.GetAsync(WeatherTiles.UpstreamUrl(layer, apiKey, z, x, y), deadline),
+                context.RequestAborted);
             var body = await response.Content.ReadAsByteArrayAsync(context.RequestAborted);
             if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
             {

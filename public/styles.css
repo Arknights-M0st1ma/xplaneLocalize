@@ -177,6 +177,7 @@ input { width: 25px; height: 25px; accent-color: var(--accent); }
 .summary dt { color: var(--muted); }
 .summary dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
 .field { display: grid; gap: 6px; margin: 0 0 14px; }
+.field-caption { color: var(--muted); font-size: 13px; }
 .field select { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid var(--line); background: #15252d; color: var(--ink); font-size: 15px; }
 .diagnostics dl { display: grid; grid-template-columns: auto 1fr; gap: 13px; margin: 0; font-size: 15px; }
 .diagnostics dt { color: var(--muted); }
