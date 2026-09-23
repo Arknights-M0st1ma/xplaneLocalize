@@ -5,6 +5,9 @@ node_modules/
 .env
 .env.*
 !.env.example
+# The train-mode demo environment holds no credentials and is the documented way to run
+# `npm run demo:tsw`, so it is tracked on purpose.
+!.env.tsw-demo
 certs/
 *.pem
 *.key

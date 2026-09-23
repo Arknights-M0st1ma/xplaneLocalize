@@ -1,12 +1,13 @@
 {
   "name": "xpanelocalize",
-  "version": "1.0.0",
+  "version": "0.4.0",
   "private": true,
-  "description": "LAN X-Plane 12 UDP to WebSocket bridge and iPad-friendly moving-map EFB",
+  "description": "LAN X-Plane 12 UDP / Train Sim World 6 HTTP API to WebSocket bridge and iPad-friendly moving-map EFB",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
     "demo": "node src/server.js --demo",
+    "demo:tsw": "node --env-file=.env.tsw-demo src/server.js --demo",
     "dev": "node --watch src/server.js",
     "test": "node --test"
   },

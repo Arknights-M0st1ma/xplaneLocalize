@@ -15,6 +15,11 @@
   "XplanePath": "",
   "GroundMinZoom": 15,
   "AirlineLogoUrlTemplate": "",
+  "ManualFolder": "",
   "ProxyMode": "system",
-  "ProxyUrl": ""
+  "ProxyUrl": "",
+  "TelemetrySource": "xp",
+  "TswApiUrl": "",
+  "TswApiKeyPath": "",
+  "TswPollHz": 4
 }

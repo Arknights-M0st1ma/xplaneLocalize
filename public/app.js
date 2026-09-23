@@ -1,4 +1,11 @@
-import { TRACK_OPTIONS, decimateTrack, pruneTrackPoints } from '/track-retention.js';
+import { TRACK_OPTIONS, pruneTrackPoints } from '/track-retention.js';
+import { nmBetween, metresBetween } from '/geo.js';
+import { initPages, showPage, setPlan, setSettingsInfo, currentPage } from '/pages.js';
+import { initManual, refreshManuals, manualInfo, openManual } from '/manual.js';
+import {
+  SOURCE_TSW, TSW_PROTOCOL, formatMetres, instrumentLabels, panelVisibility,
+  primarySpeed, secondaryReadouts, sourceInfo, statusText, trainPhase
+} from '/protocol.js';
 
 const $ = (selector) => document.querySelector(selector);
 const RAD = Math.PI / 180;
@@ -19,7 +26,6 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character
 // only the wrapper is, and pointer coordinates are converted back on the way in.
 const rotator = $('#mapRotator');
 const stage = document.getElementById('stage');
-const sidebar = $('#sidebar');
 const map = L.map('map', {
   zoomControl: false, attributionControl: false, preferCanvas: true, tap: true
 }).setView([31.1434, 121.8052], 8);
@@ -105,6 +111,51 @@ let weatherLayer = null;
 let weatherConfig = null;
 let groundConfig = null;
 
+// ------------------------------------------------------------- map palette
+// The basemap is either the light airline chart (day) or the filtered dark one
+// (night mode), so every overlay takes its colours from here. Leaflet wants
+// literal colours, so a theme switch re-styles the layers rather than re-reading
+// CSS.
+const MAP_PALETTE = {
+  day: {
+    track: { glow: '#0b5fa5', casing: '#ffffff', core: '#0b5fa5' },
+    trackStart: { ring: '#ffffff', fill: '#0b5fa5' },
+    route: { glow: '#0b5fa5', casing: '#ffffff', core: '#0b5fa5' },
+    waypoint: {
+      wpt: { ring: '#ffffff', fill: '#0b5fa5' },
+      vor: { ring: '#ffffff', fill: '#0e8a6a' },
+      ndb: { ring: '#ffffff', fill: '#b3541e' }
+    },
+    airport: { origin: '#0e8a6a', destination: '#0b5fa5', alternate: '#b3541e', ring: '#5d7285', fill: '#ffffff' },
+    ground: {
+      pavement: { edge: '#5d87a8', fill: '#cfe0ee', fillOpacity: 0.55 },
+      route: '#93a8ba',
+      marking: '#e0a92c',
+      runwayCase: '#79899a', runway: '#a7b4bf', runwayMark: '#ffffff',
+      stand: '#ffc94d', standRing: '#3d4a56'
+    }
+  },
+  night: {
+    track: { glow: '#55d6be', casing: '#03161e', core: '#7ff0d6' },
+    trackStart: { ring: '#eaf2f4', fill: '#55d6be' },
+    route: { glow: '#c77dff', casing: '#12071f', core: '#d8b4fe' },
+    waypoint: {
+      wpt: { ring: '#180d29', fill: '#e6d4ff' },
+      vor: { ring: '#180d29', fill: '#7dd3fc' },
+      ndb: { ring: '#180d29', fill: '#fca5a5' }
+    },
+    airport: { origin: '#f4b860', destination: '#f4b860', alternate: '#fca5a5', ring: '#f4b860', fill: '#08131c' },
+    ground: {
+      pavement: { edge: '#3fb2ff', fill: '#2f6f9a', fillOpacity: 0.42 },
+      route: '#8fd6ff',
+      marking: '#ffd34d',
+      runwayCase: '#1b2530', runway: '#59636f', runwayMark: '#ffffff',
+      stand: '#ffd34d', standRing: '#1b2530'
+    }
+  }
+};
+let mapPalette = MAP_PALETTE.day;
+
 // ---------------------------------------------------------------- aircraft + track
 // Three interchangeable inline SVGs (no extra requests, crisp at every zoom).
 // They are drawn nose-up and rotated with a CSS transform, so the rotation
@@ -112,22 +163,38 @@ let groundConfig = null;
 const AIRCRAFT_ICONS = {
   modern: `<svg viewBox="0 0 64 64" aria-hidden="true">
       <path d="M32 5.4c2.3 0 3.9 1.9 4.1 4.9l.7 11 16.9 9.1c.9.5 1.5 1.5 1.5 2.5v2.6c0 1.2-1.1 2-2.3 1.7l-16.1-4.3-.8 9.4 6 4.4c.7.5 1.1 1.3 1.1 2.1v1.9c0 1.1-1 2-2.2 1.8l-6.4-1.4-1.4 5.1c-.3 1.2-1.4 2-2.6 2h-.4c-1.2 0-2.3-.8-2.6-2l-1.4-5.1-6.4 1.4c-1.2.2-2.2-.7-2.2-1.8v-1.9c0-.8.4-1.6 1.1-2.1l6-4.4-.8-9.4-16.1 4.3c-1.2.3-2.3-.5-2.3-1.7v-2.6c0-1 .6-2 1.5-2.5l16.9-9.1.7-11c.2-3 1.8-4.9 4.1-4.9z" fill="#f2f7fa" stroke="#0a1620" stroke-width="2.5" stroke-linejoin="round"/>
-      <path d="M32 6.6c1.6 0 2.9 1.4 2.9 3.1v4.6h-5.8v-4.6c0-1.7 1.3-3.1 2.9-3.1z" fill="#55d6be"/>
+      <path class="accent" d="M32 6.6c1.6 0 2.9 1.4 2.9 3.1v4.6h-5.8v-4.6c0-1.7 1.3-3.1 2.9-3.1z"/>
       <path d="M27.4 21.6h9.2" stroke="#0a1620" stroke-width="1.6" opacity=".55"/>
     </svg>`,
   arrow: `<svg viewBox="0 0 64 64" aria-hidden="true">
-      <path d="M32 3.6 45.9 50.7c.5 1.6-1.3 2.9-2.7 1.8L32 45.2l-11.2 7.3c-1.4 1.1-3.2-.2-2.7-1.8L32 3.6z" fill="#f4b860" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
+      <path class="accent-warm" d="M32 3.6 45.9 50.7c.5 1.6-1.3 2.9-2.7 1.8L32 45.2l-11.2 7.3c-1.4 1.1-3.2-.2-2.7-1.8L32 3.6z" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
       <circle cx="32" cy="31" r="3.2" fill="#0a1620" opacity=".5"/>
     </svg>`,
   classic: `<svg viewBox="0 0 64 64" aria-hidden="true">
-      <path d="M32 4 56.5 56.5 32 45.4 7.5 56.5z" fill="#55d6be" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
+      <path class="accent" d="M32 4 56.5 56.5 32 45.4 7.5 56.5z" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
       <circle cx="32" cy="36" r="3" fill="#0a1620" opacity=".45"/>
+    </svg>`,
+  // Used automatically when the bridge reports the Train Sim World source. Drawn nose-up like the
+  // aircraft icons so the same rotation maths applies, but the head is at the top of the viewBox.
+  train: `<svg viewBox="0 0 64 64" aria-hidden="true">
+      <path d="M32 3.5c3.9 0 7 3.1 7 7v6.2c0 2.6-1.4 4.9-3.6 6.1 6.4 2.2 11.1 8.3 11.1 15.5v14.4c0 3.1-2.5 5.6-5.6 5.6H23.1c-3.1 0-5.6-2.5-5.6-5.6V38.3c0-7.2 4.7-13.3 11.1-15.5-2.2-1.2-3.6-3.5-3.6-6.1v-6.2c0-3.9 3.1-7 7-7Z" fill="#dfe8ee" stroke="#0a1620" stroke-width="2.6" stroke-linejoin="round"/>
+      <path d="M25.4 12.5h13.2v6.4H25.4z" fill="#2f4f63" stroke="#0a1620" stroke-width="1.6"/>
+      <path d="M20.8 33h22.4v9.4H20.8z" fill="#2f4f63" stroke="#0a1620" stroke-width="1.6"/>
+      <path class="accent-stroke" d="M27.6 6.6h8.8" stroke-width="3" stroke-linecap="round"/>
+      <circle class="accent-warm" cx="24.5" cy="52.5" r="2.6" stroke="#0a1620" stroke-width="1.4"/>
+      <circle class="accent-warm" cx="39.5" cy="52.5" r="2.6" stroke="#0a1620" stroke-width="1.4"/>
     </svg>`
 };
 let aircraftIconName = '';
 
+// The configured source, straight from /api/config. The protocol of the frames actually arriving
+// takes precedence; this is the fallback used before the first frame.
+let dataSource = { isTrain: false, protocol: '' };
+
 function aircraftHtml() {
-  const name = AIRCRAFT_ICONS[aircraftIconName] ? aircraftIconName : 'modern';
+  // The train source has exactly one icon: it is not a style choice, it is what the map is
+  // showing, so the aircraft icon picker is hidden in that mode.
+  const name = dataSource.isTrain ? 'train' : (AIRCRAFT_ICONS[aircraftIconName] ? aircraftIconName : 'modern');
   return `<div class="aircraft-marker aircraft-${name}">${AIRCRAFT_ICONS[name]}</div>`;
 }
 
@@ -146,6 +213,64 @@ function applyAircraftIcon(name, rebuild = true) {
   applyAircraftRotation();
 }
 
+// ------------------------------------------------------------------ source mode
+// The bridge can be driven by X-Plane 12 or by Train Sim World 6. Everything that differs between
+// the two is decided here, once, so the rest of the file can keep reading the same telemetry fields.
+// The decisions themselves are pure functions in protocol.js, which is unit tested.
+function applySourceMode(info) {
+  const previous = dataSource.isTrain;
+  dataSource = info;
+  const train = info.isTrain;
+  const visibility = panelVisibility(train);
+  const labels = instrumentLabels(train);
+
+  document.body.classList.toggle('mode-train', train);
+  aircraft.setIcon(L.divIcon({ className: 'aircraft-wrapper', html: aircraftHtml(), iconSize: [42, 42], iconAnchor: [21, 21] }));
+
+  // Instrument labels: the train reads km/h, shows the active speed limit where the aircraft shows
+  // altitude, and the distance to the next limit where the aircraft shows vertical speed.
+  $('#gsUnit').textContent = labels.speed;
+  $('#altUnit').textContent = labels.altitude;
+  $('#altLabel').textContent = train ? '限速' : 'ALT';
+  $('#vsLabel').textContent = train ? '下一限速' : 'V/S';
+  $('#vsUnit').textContent = train ? '' : labels.vertical;
+  // The game API exposes no heading, so the instrument is removed rather than shown empty.
+  $('#hdgInstrument').classList.toggle('hidden', !visibility.headingInstrument);
+
+  // Aviation-only panels: SimBrief routes, the airport ground layer and airline badges.
+  $('#simbriefSection').classList.toggle('hidden', !visibility.simbrief);
+  $('#groundToggle').classList.toggle('hidden', !visibility.ground);
+  $('#routeToggleRow').classList.toggle('hidden', !visibility.simbrief);
+  // setGroundEnabled()/setRouteVisible() consult the current mode themselves and keep the user's
+  // preference in dataset.wanted, so re-applying the stored values is what actually turns the
+  // aviation-only layers off for a train and back on for an aircraft.
+  setGroundEnabled($('#groundToggle').dataset.wanted === '1');
+  setRouteVisible($('#routeToggle').checked);
+  // The flight card and the train card swap places; the flight card's own visibility preference is
+  // preserved by setFlightOverlay, which knows the current mode.
+  setFlightOverlay($('#flightOverlay').dataset.wanted !== '0');
+  $('#trainCard').classList.toggle('hidden', !train || $('#trainCard').dataset.wanted === '0');
+  $('#trainToggle').classList.toggle('hidden', !train);
+  $('#flightToggleButton').classList.toggle('hidden', train);
+
+  // The aircraft icon picker has no meaning for a train, and the flight card is replaced by the
+  // train status card below.
+  $('#aircraftIconRow').classList.toggle('hidden', train);
+  // In train mode the third diagnostics row shows the TSW endpoint state instead of the ground layer.
+  $('#groundDiagnosticLabel').textContent = train ? 'TSW 端点' : '地面图层';
+  if (!train) setText('#groundDiagnostic', groundDiagnosticText());
+
+  if (previous !== train) {
+    // Switching modes invalidates what belongs to the other simulator. The route line is cleared but
+    // its toggle is left alone: the preference is re-applied by setRouteVisible above, which already
+    // knows the mode, so returning to X-Plane restores exactly what the user had.
+    if (train) routeWaypoints = [];
+    else $('#groundToggle').title = groundButtonTitle();
+    renderAirline();
+  }
+  renderAttribution();
+}
+
 // The track lives in its own canvas pane above the ground layer. A canvas path
 // handles tens of thousands of vertices without the stalls an SVG polyline of
 // the same length would cause on an iPad.
@@ -157,28 +282,41 @@ const trackRenderer = L.canvas({ pane: 'trackPane', padding: 0.5 });
 // Layered strokes: wide glow, dark casing, bright core. A canvas path cannot use
 // a gradient along its length, so the three strokes provide depth and keep the
 // track readable over bright OSM tiles.
-const trackGlow = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#55d6be', weight: 15, opacity: 0.1, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackCasing = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#03161e', weight: 9, opacity: 0.5, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackCore = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: '#7ff0d6', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
-const trackStart = L.circleMarker([0, 0], { renderer: trackRenderer, pane: 'trackPane', radius: 6, color: '#eaf2f4', weight: 2, fillColor: '#55d6be', fillOpacity: 1, interactive: false });
+const trackGlow = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: mapPalette.track.glow, weight: 15, opacity: 0.1, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackCasing = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: mapPalette.track.casing, weight: 9, opacity: 0.5, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackCore = L.polyline([], { renderer: trackRenderer, pane: 'trackPane', color: mapPalette.track.core, weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round', interactive: false, smoothFactor: 1 });
+const trackStart = L.circleMarker([0, 0], { renderer: trackRenderer, pane: 'trackPane', radius: 6, color: mapPalette.trackStart.ring, weight: 2, fillColor: mapPalette.trackStart.fill, fillOpacity: 1, interactive: false });
 const trackGroup = L.layerGroup([trackGlow, trackCasing, trackCore]).addTo(map);
 let trackStartVisible = false;
 
 // Retention policies live in track-retention.js (pure functions, unit tested).
 let trackOption = 'forever';
 let trackPoints = [];             // { lat, lng, t }
-let trackDirty = false;
-let trackSavedAt = 0;
 
 // ---------------------------------------------------------------- route overlay
-const routeLineGlow = L.polyline([], { color: '#c77dff', weight: 11, opacity: 0.12, lineCap: 'round', dashArray: '1 10', interactive: false });
-const routeLineCasing = L.polyline([], { color: '#12071f', weight: 6, opacity: 0.55, lineCap: 'round', dashArray: '1 10', interactive: false });
-const routeLine = L.polyline([], { color: '#d8b4fe', weight: 3, opacity: 0.9, lineCap: 'round', dashArray: '1 10', interactive: false });
+const routeLineGlow = L.polyline([], { color: mapPalette.route.glow, weight: 11, opacity: 0.12, lineCap: 'round', dashArray: '1 10', interactive: false });
+const routeLineCasing = L.polyline([], { color: mapPalette.route.casing, weight: 6, opacity: 0.55, lineCap: 'round', dashArray: '1 10', interactive: false });
+const routeLine = L.polyline([], { color: mapPalette.route.core, weight: 3, opacity: 0.9, lineCap: 'round', dashArray: '1 10', interactive: false });
 const routeGroup = L.layerGroup([routeLineGlow, routeLineCasing, routeLine]);
 const routeDetail = L.layerGroup();
 const routeLabels = L.layerGroup();
 let routeShown = false;
 let routeWaypoints = [];
+
+// Waypoint symbols are rebuilt rather than restyled (circle markers keep the
+// style they were created with), so the radii live here and the colours come
+// from the active palette.
+const WAYPOINT_RADIUS = { wpt: 3.5, vor: 4.5, ndb: 4.5 };
+function waypointStyle(type) {
+  const key = mapPalette.waypoint[type] ? type : 'wpt';
+  return {
+    radius: WAYPOINT_RADIUS[key],
+    color: mapPalette.waypoint[key].ring,
+    weight: 1.6,
+    fillColor: mapPalette.waypoint[key].fill,
+    fillOpacity: 0.95
+  };
+}
 
 // Names stay useful on a wide view as well, so the floor is deliberately low (5
 // covers a continent). Overlap is handled by the collision filter below instead
@@ -188,11 +326,6 @@ const WAYPOINT_LABEL_LIMIT = 90;
 const labelPool = [];
 let labelKey = "";
 
-const WAYPOINT_STYLE = {
-  wpt: { radius: 3.5, color: '#180d29', weight: 1, fillColor: '#e6d4ff', fillOpacity: 0.95 },
-  vor: { radius: 4.5, color: '#180d29', weight: 1, fillColor: '#7dd3fc', fillOpacity: 0.95 },
-  ndb: { radius: 4.5, color: '#180d29', weight: 1, fillColor: '#fca5a5', fillOpacity: 0.95 }
-};
 
 function waypointTooltip(point) {
   const parts = [`<strong>${escapeHtml(point.ident)}</strong>`];
@@ -243,7 +376,7 @@ function drawRoute(plan) {
   for (const waypoint of plan.waypoints || []) {
     if (!Number.isFinite(waypoint.lat) || !Number.isFinite(waypoint.lon)) continue;
     if (waypoint.type === 'apt' || waypoint.type === 'origin' || waypoint.type === 'destination') continue;
-    const marker = L.circleMarker([waypoint.lat, waypoint.lon], { ...(WAYPOINT_STYLE[waypoint.type] || WAYPOINT_STYLE.wpt), interactive: false });
+    const marker = L.circleMarker([waypoint.lat, waypoint.lon], { ...waypointStyle(waypoint.type), interactive: false });
     marker.bindTooltip(waypointTooltip(waypoint), { direction: 'top', offset: [0, -6], className: 'route-tooltip' });
     routeDetail.addLayer(marker);
     routeWaypoints.push(waypoint);
@@ -256,9 +389,10 @@ function drawRoute(plan) {
     if (alternate && Number.isFinite(alternate.lat)) airports.push({ ...alternate, kind: 'alternate' });
   }
   for (const airport of airports) {
+    const color = mapPalette.airport[airport.kind] ?? mapPalette.airport.destination;
     routeDetail.addLayer(L.circleMarker([airport.lat, airport.lon], {
-      radius: 6, color: airport.kind === 'alternate' ? '#fca5a5' : '#f4b860', weight: 2.5,
-      fillColor: '#08131c', fillOpacity: 0.85, interactive: false
+      radius: 6, color, weight: 2.5,
+      fillColor: mapPalette.airport.fill, fillOpacity: 0.9, interactive: false
     }));
     routeDetail.addLayer(airportLabel(airport, airport.kind));
   }
@@ -270,8 +404,10 @@ function drawRoute(plan) {
 }
 
 function setRouteVisible(visible) {
-  routeShown = visible;
-  if (visible) {
+  // A train has no SimBrief plan, so the overlay is never drawn in train mode whatever the toggle
+  // says. The toggle itself is left untouched as the user's preference for the aircraft mode.
+  routeShown = visible && !dataSource.isTrain;
+  if (routeShown) {
     routeGroup.addTo(map);
     routeDetail.addTo(map);
     routeLabels.addTo(map);
@@ -373,7 +509,6 @@ let follow = true;
 let headingUp = false;
 let firstPosition = true;
 let lastTelemetry = null;
-let lastTrackPoint = null;
 let socket;
 let reconnectTimer;
 
@@ -386,25 +521,12 @@ function setStatus(kind, text) {
   $('#statusText').textContent = text;
 }
 
-function distanceMeters(a, b) {
-  const dLat = (b[0] - a[0]) * RAD;
-  const dLon = (b[1] - a[1]) * RAD;
-  const x = dLon * Math.cos(((a[0] + b[0]) * RAD) / 2);
-  return Math.sqrt(dLat * dLat + x * x) * 6371000;
-}
-
-// Points are buffered and drawn at most a few times per second: the telemetry
-// arrives at 5-10 Hz and redrawing the whole polyline on every packet is what
-// makes long tracks feel sluggish.
-function pushTrackPoint(position) {
-  trackPoints.push({ lat: position[0], lng: position[1], t: Date.now() });
-  trackDirty = true;
-}
-
-function pruneTrack() {
-  trackPoints = pruneTrackPoints(trackPoints, trackOption);
-}
-
+// The bridge records the flown track and this page only reads it back.
+//
+// That split is deliberate: while iPadOS has Safari suspended (screen locked,
+// another app in front, the socket dropped) this page is not running at all, so
+// anything it "records" has a hole in it. The PC is always running, so it keeps
+// the track continuous and hands it over on request - the page just draws it.
 function renderTrack() {
   const latlngs = trackPoints.map((point) => [point.lat, point.lng]);
   trackCore.setLatLngs(latlngs);
@@ -447,65 +569,65 @@ function updateTrackSummary() {
   }
   const span = trackPoints[trackPoints.length - 1].t - trackPoints[0].t;
   const hidden = map.hasLayer(trackGroup) ? '' : '（轨迹已隐藏）';
-  node.textContent = `已记录 ${trackPoints.length.toLocaleString('en-US')} 个点 · 跨度 ${formatSpan(span)}${hidden}`;
+  const stale = trackStatus === 'ready' ? '' : '（电脑端未响应）';
+  node.textContent = `电脑端已记录 ${trackPoints.length.toLocaleString('en-US')} 个点 · 跨度 ${formatSpan(span)}${hidden}${stale}`;
+  if (typeof pushSettingsInfo === 'function') pushSettingsInfo();
 }
 
-function flushTrack() {
-  if (!trackDirty) return;
-  trackDirty = false;
-  pruneTrack();
-  renderTrack();
-  maybeSaveTrack();
+let trackStatus = 'ready';
+let trackPollTimer = 0;
+let trackRequest = null;
+
+function trackUrl(since) {
+  const query = new URLSearchParams();
+  if (Number.isFinite(since)) query.set('since', String(Math.round(since)));
+  const suffix = query.toString();
+  return `/api/track${suffix ? `?${suffix}` : ''}`;
 }
 
-function clearTrack() {
-  trackPoints = [];
-  trackDirty = false;
-  lastTrackPoint = null;
-  renderTrack();
-  try { localStorage.removeItem('efb.track'); } catch { /* private mode */ }
-  showToast('轨迹已清除');
-}
-
-// The track is also kept in localStorage so "永久保留" survives a reload. The
-// payload is trimmed rather than dropped when it gets big, and any storage error
-// simply disables persistence for the session.
-let trackPersistDisabled = false;
-
-function maybeSaveTrack(force = false) {
-  if (trackPersistDisabled) return;
-  const now = Date.now();
-  if (!force && now - trackSavedAt < 12000) return;
-  trackSavedAt = now;
+// since === null asks for the whole retained track; a timestamp asks for what
+// happened since, which is how a page that was asleep for ten minutes catches up
+// in one request.
+async function loadTrack(since = null) {
   try {
-    let points = trackPoints;
-    let payload = '';
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      payload = JSON.stringify(points.map((point) => [
-        Math.round(point.lat * 1e5) / 1e5,
-        Math.round(point.lng * 1e5) / 1e5,
-        Math.round(point.t / 1000)
-      ]));
-      if (payload.length <= 1200000) break;
-      points = decimateTrack(points, Math.floor(points.length / 2));
+    const response = await fetch(trackUrl(since));
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const incoming = (data.points || [])
+      .filter((point) => Array.isArray(point) && point.length >= 3)
+      .map((point) => ({ lat: point[0], lng: point[1], t: point[2] }));
+    if (data.replaced || since === null || trackPoints.length === 0) {
+      trackPoints = incoming;
+    } else {
+      const newest = trackPoints[trackPoints.length - 1].t;
+      trackPoints = trackPoints.concat(incoming.filter((point) => point.t > newest));
     }
-    if (payload.length > 1200000) { trackPersistDisabled = true; return; }
-    localStorage.setItem('efb.track', payload);
-  } catch { trackPersistDisabled = true; }
+    // The bridge keeps everything it is allowed to record; how much of it is
+    // drawn is still this page's decision (the "航迹保留" selector).
+    trackPoints = pruneTrackPoints(trackPoints, trackOption);
+    trackStatus = 'ready';
+    renderTrack();
+  } catch {
+    // An older bridge has no /api/track; say so instead of drawing nothing.
+    trackStatus = 'error';
+    updateTrackSummary();
+  }
 }
 
-function restoreTrack() {
+function pollTrack() {
+  if (document.hidden) return;               // no point asking while suspended
+  if (trackRequest) return;                  // one request in flight at a time
+  const newest = trackPoints.length > 0 ? trackPoints[trackPoints.length - 1].t : null;
+  trackRequest = loadTrack(newest).finally(() => { trackRequest = null; });
+}
+
+async function clearTrack() {
   try {
-    const raw = localStorage.getItem('efb.track');
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return;
-    trackPoints = parsed
-      .filter((point) => Array.isArray(point) && point.length >= 3 && Number.isFinite(point[0]) && Number.isFinite(point[1]))
-      .map((point) => ({ lat: point[0], lng: point[1], t: point[2] * 1000 }));
-    pruneTrack();
-    renderTrack();
-  } catch { /* a corrupt entry must never stop the map from loading */ }
+    await fetch('/api/track', { method: 'DELETE' });
+  } catch { /* the local copy is cleared either way */ }
+  trackPoints = [];
+  renderTrack();
+  showToast('电脑端的轨迹已清除');
 }
 
 function setTrackOption(value) {
@@ -513,32 +635,76 @@ function setTrackOption(value) {
   store('efb.trackOption', trackOption);
   const select = $('#trackOption');
   if (select && select.value !== trackOption) select.value = trackOption;
-  pruneTrack();
+  // Nothing to ask the bridge: the recorded track is unchanged, only how much of
+  // it is drawn.
+  trackPoints = pruneTrackPoints(trackPoints, trackOption);
   renderTrack();
-  maybeSaveTrack(true);
 }
 
 function initTrack() {
-  // Restore before anything can write: applying the option at start-up used to
-  // save an empty track over the stored one, so "永久保留" was lost on reload.
   const stored = readStored('efb.trackOption');
   trackOption = TRACK_OPTIONS[stored] ? stored : 'forever';
   const select = $('#trackOption');
   if (select) select.value = trackOption;
-  restoreTrack();
-  setInterval(flushTrack, 400);
-  setInterval(() => maybeSaveTrack(), 15000);
-  window.addEventListener('pagehide', () => maybeSaveTrack(true));
+  loadTrack(null);
+  trackPollTimer = setInterval(pollTrack, 2000);
+  // Coming back from the background is exactly the case that used to lose the
+  // middle of the flight: ask for the missed section straight away.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) pollTrack(); });
+  window.addEventListener('online', () => pollTrack());
+}
+
+// ------------------------------------------------------------- train status
+// Train Sim World 6 has no flight plan, so the flight card cannot be reused: the driver-relevant
+// numbers come from the game's driver-aid endpoint and are absent whenever that endpoint is not
+// available. Everything the front end knows about them is in protocol.js.
+const TRAIN_FIELDS = ['tcSpeed', 'tcLimit', 'tcNextLimit', 'tcLimitDistance', 'tcSignal', 'tcSignalDistance', 'tcGradient'];
+
+function setTrainCard(visible) {
+  $('#trainCard').dataset.wanted = visible ? '1' : '0';
+  // Like the flight card, this one only exists in train mode; the preference is kept so switching
+  // back to the train source restores what the user chose.
+  $('#trainCard').classList.toggle('hidden', !visible || !dataSource.isTrain);
+  $('#trainToggle').classList.toggle('active', visible && dataSource.isTrain);
+  $('#trainToggle').classList.toggle('hidden', !dataSource.isTrain);
+  store('efb.trainVisible', visible ? '1' : '0');
+}
+
+function renderTrainStatus(data) {
+  if (!data || !dataSource.isTrain) return;
+  const speed = primarySpeed(data, true);
+  setText('#tcSpeed', speed === null ? '—' : `${format(speed, 1)} km/h`);
+  setText('#tcLimit', Number.isFinite(data.limitKmh) ? `${Math.round(data.limitKmh)} km/h` : '—');
+  setText('#tcNextLimit', Number.isFinite(data.nextLimitKmh) ? `${Math.round(data.nextLimitKmh)} km/h` : '—');
+  setText('#tcLimitDistance', formatMetres(data.distanceToNextLimitM));
+  setText('#tcSignalDistance', formatMetres(data.distanceToSignalM));
+  setText('#tcSignal', data.signalAspect || '—');
+  setText('#tcGradient', Number.isFinite(data.gradient) ? `${data.gradient > 0 ? '+' : ''}${data.gradient}‰` : '—');
+  setText('#tcService', data.currentServiceName || '列车');
+  setText('#tcPhase', trainPhase(speed));
+  setText('#tcUpdated', data.receivedAt ? `${new Date(data.receivedAt).toISOString().slice(11, 19)}Z` : '—');
 }
 
 function updateTelemetry(data) {
   lastTelemetry = data;
-  $('#gs').textContent = format(data.groundSpeedKt ?? data.trueAirspeedKt ?? data.indicatedAirspeedKt);
-  $('#alt').textContent = format(data.altitudeMslFt);
+  // The frame in hand decides which simulator is on screen: it is more trustworthy than the
+  // configuration, which may already describe the source the bridge is switching to.
+  const info = sourceInfo(data.protocol, dataSource.configured);
+  if (info.isTrain !== dataSource.isTrain) {
+    dataSource = { ...info, configured: dataSource.configured };
+    applySourceMode(dataSource);
+  }
+
+  const speed = primarySpeed(data, dataSource.isTrain);
+  $('#gs').textContent = speed === null ? '—' : format(speed, dataSource.isTrain ? 1 : 0);
+  const secondary = secondaryReadouts(data, dataSource.isTrain);
+  $('#alt').textContent = dataSource.isTrain
+    ? (Number.isFinite(secondary.altitude) ? String(Math.round(secondary.altitude)) : '—')
+    : format(secondary.altitude);
   $('#hdg').textContent = Number.isFinite(data.headingTrueDeg) ? String(Math.round(wrap360(data.headingTrueDeg))).padStart(3, '0') : '—';
-  $('#vs').textContent = format(data.verticalSpeedFpm);
+  $('#vs').textContent = dataSource.isTrain ? formatMetres(secondary.vertical) : format(secondary.vertical);
   $('#sourceDiagnostic').textContent = `${data.source || '—'} · ${data.protocol || '—'}`;
-  setStatus('live', data.protocol === 'DEMO' ? '演示数据' : '数据实时');
+  setStatus('live', statusText('live', dataSource.isTrain) + (data.protocol === 'DEMO' ? '（演示）' : ''));
 
   if (!Number.isFinite(data.latitude) || !Number.isFinite(data.longitude)) return;
   const position = [data.latitude, data.longitude];
@@ -547,10 +713,7 @@ function updateTelemetry(data) {
   applyAircraftRotation();
   updateHeading(Number.isFinite(data.headingTrueDeg) ? data.headingTrueDeg : null);
 
-  if (!lastTrackPoint || distanceMeters(lastTrackPoint, position) > 12) {
-    pushTrackPoint(position);
-    lastTrackPoint = position;
-  }
+  // The track is not recorded here: the bridge owns it (see loadTrack below).
   if (firstPosition) {
     map.setView(position, 12, { animate: false });
     firstPosition = false;
@@ -567,12 +730,22 @@ function connect() {
   $('#wsDiagnostic').textContent = '连接中';
   socket.addEventListener('open', () => {
     $('#wsDiagnostic').textContent = '已连接';
-    if (!lastTelemetry) setStatus('waiting', '等待 UDP');
+    if (!lastTelemetry) setStatus('waiting', statusText('waiting', dataSource.isTrain));
+    // A reconnect may have followed a long gap: fill in the track the bridge
+    // recorded while this page was off the air.
+    pollTrack();
   });
   socket.addEventListener('message', (event) => {
     try {
       const message = JSON.parse(event.data);
       if (message.type === 'telemetry') updateTelemetry(message.payload);
+      // The hello frame carries the configured source, so the right icon, units and panels are in
+      // place before the first telemetry frame (which can take seconds in TSW mode).
+      else if (message.type === 'hello' && message.payload?.source) {
+        dataSource = { ...sourceInfo('', message.payload.source), configured: message.payload.source };
+        applySourceMode(dataSource);
+        if (!lastTelemetry) setStatus('waiting', statusText('waiting', dataSource.isTrain));
+      }
     } catch (error) {
       console.warn('telemetry failed', error);
       showToast('收到无法解析的数据');
@@ -691,6 +864,24 @@ function applyNightMode(enabled) {
   store('efb.nightMode', enabled ? '1' : '0');
   const toggle = $('#nightToggle');
   if (toggle) toggle.checked = Boolean(enabled);
+  syncMirror('#nightToggleMirror', Boolean(enabled));
+  // Night mode now switches the whole interface, not just the tiles: the pages
+  // and the map overlays follow the same palette.
+  mapPalette = enabled ? MAP_PALETTE.night : MAP_PALETTE.day;
+  applyMapPalette();
+}
+
+function applyMapPalette() {
+  trackGlow.setStyle({ color: mapPalette.track.glow });
+  trackCasing.setStyle({ color: mapPalette.track.casing });
+  trackCore.setStyle({ color: mapPalette.track.core });
+  trackStart.setStyle({ color: mapPalette.trackStart.ring, fillColor: mapPalette.trackStart.fill });
+  routeLineGlow.setStyle({ color: mapPalette.route.glow });
+  routeLineCasing.setStyle({ color: mapPalette.route.casing });
+  routeLine.setStyle({ color: mapPalette.route.core });
+  // Markers keep the style they were created with, so the themed ones are rebuilt.
+  if (flightPlan) drawRoute(flightPlan);
+  if (groundEnabled) updateGroundLayer(true);
 }
 
 function renderAttribution() {
@@ -699,68 +890,8 @@ function renderAttribution() {
   $('#mapAttribution').innerHTML = parts.filter(Boolean).join(' · ');
 }
 
-// The sidebar pushes the map aside on wide screens (nothing is covered, every
-// map gesture keeps working) and falls back to an overlay drawer on narrow ones.
-const SIDEBAR_MIN = 300;
-const SIDEBAR_MAX = 560;
-
-function compactLayout() {
-  return window.matchMedia('(max-width: 699px)').matches;
-}
-
-function setSidebarWidth(pixels) {
-  const limit = Math.min(SIDEBAR_MAX, Math.round(window.innerWidth * 0.52));
-  const width = Math.max(SIDEBAR_MIN, Math.min(limit, Math.round(pixels)));
-  document.documentElement.style.setProperty('--sidebar-width', `${width}px`);
-  store('efb.sidebarWidth', String(width));
-  return width;
-}
-
-function setSidebar(open) {
-  document.body.classList.toggle('sidebar-open', open);
-  sidebar.setAttribute('aria-hidden', String(!open));
-  $('#scrim').classList.toggle('open', Boolean(open) && compactLayout());
-  store('efb.sidebarOpen', open ? '1' : '0');
-  if (!compactLayout()) requestAnimationFrame(() => map.invalidateSize());
-}
-
-function sidebarIsOpen() {
-  return document.body.classList.contains('sidebar-open');
-}
-
-function wireSidebarResize() {
-  const handle = $('#sidebarResizer');
-  let startX = 0;
-  let startWidth = 0;
-  let frame = null;
-  const move = (event) => {
-    setSidebarWidth(startWidth + (startX - event.clientX));
-    if (frame === null) {
-      frame = requestAnimationFrame(() => {
-        frame = null;
-        layoutRotator();
-        map.invalidateSize();
-      });
-    }
-  };
-  const stop = (event) => {
-    handle.removeEventListener('pointermove', move);
-    window.removeEventListener('pointerup', stop);
-    window.removeEventListener('pointercancel', stop);
-    if (event) handle.releasePointerCapture?.(event.pointerId);
-  };
-  handle.addEventListener('pointerdown', (event) => {
-    if (compactLayout()) return;
-    startX = event.clientX;
-    startWidth = sidebar.getBoundingClientRect().width;
-    handle.setPointerCapture?.(event.pointerId);
-    handle.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', stop);
-    window.addEventListener('pointercancel', stop);
-    event.preventDefault();
-  });
-}
-
+// The rail and the page switching live in pages.js; this file only has to know
+// that the layout changed (Leaflet needs to re-measure) and which page is up.
 let toastTimer;
 function showToast(message) {
   $('#toast').textContent = message;
@@ -769,9 +900,6 @@ function showToast(message) {
   toastTimer = setTimeout(() => $('#toast').classList.remove('show'), 2200);
 }
 
-$('#menuButton').addEventListener('click', () => setSidebar(!sidebarIsOpen()));
-$('#closeButton').addEventListener('click', () => setSidebar(false));
-$('#scrim').addEventListener('click', () => setSidebar(false));
 $('#followButton').addEventListener('click', () => setFollow(!follow));
 $('#headingUpButton').addEventListener('click', () => setHeadingUp(!headingUp));
 $('#zoomInButton').addEventListener('click', () => map.zoomIn());
@@ -781,6 +909,7 @@ $('#trackToggle').addEventListener('change', (event) => {
   if (event.target.checked) trackGroup.addTo(map);
   else trackGroup.removeFrom(map);
   updateTrackSummary();
+  syncMirror('#trackToggleMirror', event.target.checked);
 });
 $('#trackOption').addEventListener('change', (event) => setTrackOption(event.target.value));
 $('#aircraftIcon').addEventListener('change', (event) => applyAircraftIcon(event.target.value));
@@ -789,6 +918,19 @@ $('#routeToggle').addEventListener('change', (event) => setRouteVisible(event.ta
 $('#simbriefRefreshButton').addEventListener('click', () => loadFlightPlan(true));
 $('#planSelect').addEventListener('change', (event) => selectPlan(event.target.value));
 $('#ofpButton').addEventListener('click', () => openOfp());
+
+// The 设置 page repeats the two most used switches. They are the same setting,
+// so both directions stay in step instead of drifting apart.
+function syncMirror(selector, checked) {
+  const mirror = $(selector);
+  if (mirror && mirror.checked !== checked) mirror.checked = checked;
+}
+$('#trackToggleMirror').addEventListener('change', (event) => {
+  const real = $('#trackToggle');
+  real.checked = event.target.checked;
+  real.dispatchEvent(new Event('change'));
+});
+$('#nightToggleMirror').addEventListener('change', (event) => applyNightMode(event.target.checked));
 $('#ofpCloseButton').addEventListener('click', closeOfp);
 $('#ofpView').addEventListener('click', (event) => { if (event.target === $('#ofpView')) closeOfp(); });
 $('#weatherToggle').addEventListener('click', () => {
@@ -803,6 +945,8 @@ $('#groundToggle').addEventListener('click', () => setGroundEnabled(!groundEnabl
 $('#foHideButton').addEventListener('click', () => setFlightOverlay(false));
 $('#flightRestoreButton').addEventListener('click', () => setFlightOverlay(true));
 $('#flightToggleButton').addEventListener('click', () => setFlightOverlay($('#flightOverlay').classList.contains('hidden')));
+$('#trainToggle').addEventListener('click', () => setTrainCard($('#trainCard').classList.contains('hidden')));
+$('#tcHideButton').addEventListener('click', () => setTrainCard(false));
 $('#nightToggle').addEventListener('change', (event) => applyNightMode(event.target.checked));
 $('#foCollapseButton').addEventListener('click', () => {
   const overlay = $('#flightOverlay');
@@ -824,11 +968,9 @@ function resize() {
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 250));
 if ('ResizeObserver' in window) new ResizeObserver(() => resize()).observe(stage);
-window.matchMedia('(max-width: 699px)').addEventListener('change', () => {
-  // Switching between pushed sidebar and overlay drawer.
-  setSidebar(sidebarIsOpen());
-  setTimeout(resize, 220);
-});
+// The rail turns into an overlay below 900px (pages.js handles the scrim); the
+// map still has to re-measure when that switch happens.
+window.matchMedia('(max-width: 900px)').addEventListener('change', () => setTimeout(resize, 220));
 
 document.querySelectorAll('input[name="base"]').forEach((input) =>
   input.addEventListener('change', (event) => switchBaseLayer(event.target.value)));
@@ -863,14 +1005,7 @@ function formatDuration(seconds) {
 }
 
 // ------------------------------------------------------------- flight status
-const NM_PER_DEGREE = 60;
 const MIN_AIRBORNE_GROUND_SPEED = 30; // kt; below this the aircraft is on the ground
-
-function nmBetween(a, b) {
-  const dLat = (b[0] - a[0]) * RAD;
-  const dLon = (b[1] - a[1]) * RAD * Math.cos(((a[0] + b[0]) * RAD) / 2);
-  return Math.sqrt(dLat * dLat + dLon * dLon) * NM_PER_DEGREE;
-}
 
 let flightPlan = null;
 let flightRoute = [];
@@ -984,6 +1119,13 @@ function renderFlightPlanFields() {
   const overnight = flight && utcDate(flight.plannedOn) !== utcDate(flight.plannedOff) ? '+1' : '';
   setText('#foCallsign', flight?.callsign || '—');
   setText('#foAircraft', flight ? [type, flight.registration].filter(Boolean).join(' · ') : '—');
+  // The header carries the flight identity the way an airline EFB does, and
+  // falls back to the product name when there is no plan.
+  const route = flightPlan?.origin?.ident && flightPlan?.destination?.ident
+    ? `${flightPlan.origin.ident} → ${flightPlan.destination.ident}`
+    : '';
+  setText('#brandTitle', flight?.callsign || 'PORTABLE EFB');
+  setText('#brandSub', [route, type].filter(Boolean).join(' · ') || '局域网移动地图 EFB');
   const airlineName = airlineFor(flight?.callsign)?.name ?? '';
   if (airlineName) setText('#foAircraft', [airlineName, type, flight?.registration].filter(Boolean).join(' · '));
   renderAirline();
@@ -1007,6 +1149,9 @@ function renderFlightStatus(force = false) {
   lastFlightRender = now;
   lastFlightTelemetryAt = data.receivedAt;
   const position = Number.isFinite(data.latitude) && Number.isFinite(data.longitude) ? [data.latitude, data.longitude] : null;
+  // The train card is fed from the same frame and is throttled by the same clock, so both cards
+  // share this render point instead of each running its own timer.
+  renderTrainStatus(data);
   const destination = flightPlan?.destination;
   const alongRoute = position ? remainingAlongRoute(position) : null;
   const direct = position && Number.isFinite(destination?.lat) && Number.isFinite(destination?.lon)
@@ -1020,23 +1165,37 @@ function renderFlightStatus(force = false) {
     ? `${Math.round(remaining).toLocaleString('en-US')} NM${Number.isFinite(alongRoute) ? '' : '（直飞）'}`
     : '—');
 
+  const etaDelta = $('#foEtaDelta');
   if (Number.isFinite(remaining) && airborne) {
     const seconds = (remaining / groundSpeed) * 3600;
     setText('#foRemainingTime', formatDuration(seconds));
     const eta = new Date(now + seconds * 1000);
-    const etaText = `${String(eta.getUTCHours()).padStart(2, '0')}:${String(eta.getUTCMinutes()).padStart(2, '0')}Z`;
-    let compare = '';
+    setText('#foEta', `${String(eta.getUTCHours()).padStart(2, '0')}:${String(eta.getUTCMinutes()).padStart(2, '0')}Z`);
+    // On-time performance sits next to the ETA instead of inside it: the old
+    // single string wrapped onto three lines on an iPad.
+    let label = '';
+    let late = false;
     const planned = flightPlan?.flight?.plannedOn;
     if (planned) {
       const difference = (eta.getTime() - Date.parse(planned)) / 1000;
-      if (Number.isFinite(difference) && Math.abs(difference) >= 60) {
-        compare = `（计划 ${utcClock(planned)}Z · ${difference > 0 ? '晚' : '早'} ${formatDuration(Math.abs(difference))}）`;
+      if (Number.isFinite(difference)) {
+        if (Math.abs(difference) < 60) label = '准点';
+        else {
+          label = `${difference > 0 ? '晚' : '早'} ${formatDuration(Math.abs(difference))}`;
+          late = difference > 0;
+        }
       }
     }
-    setText('#foEta', `${etaText}${compare}`);
+    if (etaDelta) {
+      etaDelta.textContent = label;
+      etaDelta.classList.toggle('hidden', label.length === 0);
+      etaDelta.classList.toggle('late', late);
+      etaDelta.classList.toggle('early', label.startsWith('早'));
+    }
   } else {
     setText('#foRemainingTime', '未知');
     setText('#foEta', Number.isFinite(remaining) ? '未知（地速不足）' : '未知');
+    if (etaDelta) etaDelta.classList.add('hidden');
   }
 
   const total = flightRouteTotal > 0 ? flightRouteTotal : (Number.isFinite(flightPlan?.distanceNm) ? flightPlan.distanceNm : null);
@@ -1057,11 +1216,16 @@ function renderFlightStatus(force = false) {
 }
 
 function setFlightOverlay(visible) {
-  $('#flightOverlay').classList.toggle('hidden', !visible);
-  $('#flightToggleButton').classList.toggle('active', visible);
-  $('#flightToggleButton').setAttribute('aria-pressed', String(visible));
+  // Remembered separately from the rendered state: in train mode the card is forced hidden, and the
+  // user's preference has to survive that so switching back restores what they chose.
+  $('#flightOverlay').dataset.wanted = visible ? '1' : '0';
+  const shown = visible && !dataSource.isTrain;
+  $('#flightOverlay').classList.toggle('hidden', !shown);
+  $('#flightToggleButton').classList.toggle('hidden', dataSource.isTrain);
+  $('#flightToggleButton').classList.toggle('active', shown);
+  $('#flightToggleButton').setAttribute('aria-pressed', String(shown));
   // Small restore icon in the left column, above the weather switcher.
-  $('#flightRestoreButton').classList.toggle('hidden', visible);
+  $('#flightRestoreButton').classList.toggle('hidden', shown || dataSource.isTrain);
   store('efb.flightVisible', visible ? '1' : '0');
 }
 
@@ -1117,6 +1281,7 @@ function setRouteSummary(plan) {
   if (!plan) {
     summary.classList.add('hidden');
     setFlightOverlayPlan(null);
+    setPlan(null, { status: $('#simbriefStatus')?.textContent ?? '' });
     return;
   }
   summary.classList.remove('hidden');
@@ -1125,6 +1290,20 @@ function setRouteSummary(plan) {
   setText('#routeString', plan.route || '—');
   setText('#routeWaypoints', `${(plan.waypoints || []).length} 个航点${plan.distanceNm ? ` · ${Math.round(plan.distanceNm)} NM` : ''}`);
   setFlightOverlayPlan(plan);
+  // The plan page shows everything the OFP carries, including weights, fuel and
+  // the per-leg distances/ETAs that the map card has no room for.
+  setPlan(plan, { status: $('#simbriefStatus')?.textContent ?? '' });
+}
+
+// The 设置 page mirrors what this page knows about the connection, the manual
+// folder and the recorded track.
+function pushSettingsInfo() {
+  setSettingsInfo({
+    manuals: manualInfo(),
+    source: `${dataSource.isTrain ? 'Train Sim World 6' : 'X-Plane 12'} · ${lastTelemetry?.protocol ?? '—'}`,
+    trackPoints: trackPoints.length,
+    version: 'v28'
+  });
 }
 
 function applyPlan(result, refreshed) {
@@ -1360,7 +1539,11 @@ async function bootstrap() {
   setupWeather(config.weather);
   groundConfig = config.ground ?? null;
   airlineLogoUrlTemplate = config.airlineLogoUrlTemplate ?? '';
+  // The configured source decides the icon, the units and which panels exist before the first frame
+  // arrives; the protocol of the frames themselves takes over in updateTelemetry().
+  dataSource = { ...sourceInfo('', config.telemetrySource), configured: config.telemetrySource };
   await loadAirlines();
+  $('#groundToggle').dataset.wanted = readStored('efb.ground') === '1' ? '1' : '0';
   setGroundEnabled(readStored('efb.ground') === '1');
   $('#weatherOpacity').value = String(weatherOpacityValue());
   if (config.customBaseMap) {
@@ -1377,9 +1560,18 @@ async function bootstrap() {
   initTrack();
   applyAircraftIcon(readStored('efb.aircraftIcon') || 'modern');
   applyNightMode(readStored('efb.nightMode') === '1');
-  setSidebarWidth(Number(readStored('efb.sidebarWidth')) || 380);
-  setSidebar(readStored('efb.sidebarOpen') === '1');
-  wireSidebarResize();
+  // Rail + pages first: initTrack() and the map both need to know the final
+  // layout, and the manual list is what the 手册 page shows on first open.
+  initPages({
+    onLayout: () => requestAnimationFrame(() => { layoutRotator(); map.invalidateSize(); }),
+    onPageShown: (name) => {
+      if (name === 'map') requestAnimationFrame(() => { layoutRotator(); map.invalidateSize(); });
+      if (name === 'plan') setPlan(flightPlan, { status: $('#simbriefStatus')?.textContent ?? '' });
+      if (name === 'settings') pushSettingsInfo();
+    }
+  });
+  initManual();
+  refreshManuals().then(pushSettingsInfo);
   wireFlightDrag();
   const storedPosition = readStored('efb.flightPosition');
   if (storedPosition.includes(',')) {
@@ -1396,8 +1588,34 @@ async function bootstrap() {
   }
   setFlightOverlay(readStored('efb.flightVisible') !== '0');
   setRouteVisible($('#routeToggle').checked);
+  applySourceMode(dataSource);
+  setTrainCard(readStored('efb.trainVisible') !== '0');
   connect();
-  loadFlightPlan(false);
+  // A train has no SimBrief plan and no airport ground layout, so neither endpoint is even asked:
+  // that also keeps the settings-window "not configured" prompts from appearing for the wrong mode.
+  if (!dataSource.isTrain) {
+    loadFlightPlan(false);
+  } else {
+    loadTswStatus();
+  }
+}
+
+// Reports the source's own health in the diagnostics drawer. The browser cannot reach the game API
+// itself (it is on the game machine's loopback), so the bridge is the only witness.
+async function loadTswStatus() {
+  try {
+    const response = await fetch('/api/tsw/status');
+    if (!response.ok) return;
+    const data = await response.json();
+    const status = data.status;
+    if (!status) {
+      setText('#groundDiagnostic', '—');
+      return;
+    }
+    const endpoints = status.endpoints ?? {};
+    const live = [endpoints.position, endpoints.speed, endpoints.driverAid].filter(Boolean);
+    setText('#groundDiagnostic', `${status.note || '—'}${live.length > 0 ? `（${live.join(' · ')}）` : ''}`);
+  } catch { /* diagnostics only */ }
 }
 
 // ---------------------------------------------------------------- ground layout
@@ -1419,6 +1637,11 @@ let groundRetryTimer = 0;
 let groundNotice = '';
 let groundNoticeAt = 0;
 let groundLoadedIcao = '';
+// How far the aircraft may drift before the ground layout is looked up again.
+// The lookup itself uses an 8 NM radius, so half of that is the right
+// granularity. (While nmBetween() was mis-scaled this check was effectively
+// 86 NM, which is why the layer never followed the aircraft.)
+const GROUND_REANCHOR_NM = 4;
 
 function groundConfigured() {
   return Boolean(groundConfig?.configured);
@@ -1454,6 +1677,17 @@ function setGroundDiagnostic(text) {
   if (node) node.textContent = text;
 }
 
+// The current ground-layer diagnostic text, so switching away from train mode can restore the row
+// without waiting for the next map move to recompute it.
+function groundDiagnosticText() {
+  if (!groundConfigured()) return '未配置 X-Plane 12 安装目录';
+  if (!groundEnabled) return '已关闭';
+  const minZoom = groundConfig.minZoom ?? 15;
+  if (!groundZoomReady()) return `已开启 · 缩放到 ${minZoom} 级后加载（当前 ${Math.round(map.getZoom())}）`;
+  if (groundAirport) return `${groundAirport} · ${groundData ? groundSummary(groundData) : '加载中'}`;
+  return '已开启 · 正在加载…';
+}
+
 function groundSummary(airport) {
   const count = (list) => (list ?? []).length;
   const parts = [];
@@ -1466,18 +1700,22 @@ function groundSummary(airport) {
 }
 
 function setGroundEnabled(enabled) {
-  groundEnabled = enabled;
-  store('efb.ground', enabled ? '1' : '0');
+  // The user's preference is stored separately from the rendered state, because train mode forces
+  // the layer off (airport taxiways are not railways). Without this, entering train mode would
+  // silently overwrite the preference and the layer would stay off after switching back.
   const button = $('#groundToggle');
+  if (button) button.dataset.wanted = enabled ? '1' : '0';
+  store('efb.ground', enabled ? '1' : '0');
+  groundEnabled = enabled && !dataSource.isTrain;
   if (button) {
-    button.classList.toggle('active', enabled);
-    button.setAttribute('aria-pressed', String(enabled));
+    button.classList.toggle('active', groundEnabled);
+    button.setAttribute('aria-pressed', String(groundEnabled));
     // Kept clickable on purpose: pressing it re-reads the configuration, so a
     // folder picked in the desktop settings window takes effect immediately.
     button.disabled = false;
     button.title = groundButtonTitle();
   }
-  if (!enabled)
+  if (!groundEnabled)
   {
     clearGround();
     setGroundDiagnostic('已关闭');
@@ -1534,7 +1772,7 @@ function updateGroundLayer(force = false) {
   const reference = Number.isFinite(lastTelemetry?.latitude) && Number.isFinite(lastTelemetry?.longitude)
     ? [lastTelemetry.latitude, lastTelemetry.longitude]
     : [map.getCenter().lat, map.getCenter().lng];
-  if (!force && groundAnchor && nmBetween(groundAnchor, reference) < 1.5 && groundAirport) {
+  if (!force && groundAnchor && nmBetween(groundAnchor, reference) < GROUND_REANCHOR_NM && groundAirport) {
     // Same airport: only the gate/sign labels depend on the zoom level, so
     // rebuild those when the zoom changed and skip the network round trip.
     if (map.getZoom() !== groundLabelZoom && groundData) {
@@ -1601,21 +1839,22 @@ function drawGround(airport) {
     if ((pavement.points ?? []).length < 3) continue;
     add(L.polygon(pavement.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#3fb2ff', weight: 1.6, opacity: .95, fillColor: '#2f6f9a', fillOpacity: .42
+      color: mapPalette.ground.pavement.edge, weight: 1.6, opacity: .95,
+      fillColor: mapPalette.ground.pavement.fill, fillOpacity: mapPalette.ground.pavement.fillOpacity
     }));
   }
   for (const route of airport.routes ?? []) {
     if ((route.points ?? []).length < 2) continue;
     add(L.polyline(route.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#8fd6ff', weight: 1.6, opacity: .45, dashArray: '3 7'
+      color: mapPalette.ground.route, weight: 1.6, opacity: .45, dashArray: '3 7'
     }));
   }
   for (const line of airport.lines ?? []) {
     if ((line.points ?? []).length < 2) continue;
     add(L.polyline(line.points, {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#ffd34d', weight: Math.max(2, Math.min(4, map.getZoom() - 13)), opacity: .95
+      color: mapPalette.ground.marking, weight: Math.max(2, Math.min(4, map.getZoom() - 13)), opacity: .95
     }));
   }
   for (const runway of airport.runways ?? []) {
@@ -1623,21 +1862,21 @@ function drawGround(airport) {
     const weight = Math.max(6, Math.min(20, (runway.widthM ?? 45) / 5.5));
     add(L.polyline([runway.a, runway.b], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#1b2530', weight: weight + 2.5, opacity: .55
+      color: mapPalette.ground.runwayCase, weight: weight + 2.5, opacity: .55
     }));
     add(L.polyline([runway.a, runway.b], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#59636f', weight, opacity: .95
+      color: mapPalette.ground.runway, weight, opacity: .95
     }));
     add(L.polyline([runway.a, runway.b], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      color: '#ffffff', weight: Math.max(1.6, weight / 7), opacity: .92, dashArray: '7 9'
+      color: mapPalette.ground.runwayMark, weight: Math.max(1.6, weight / 7), opacity: .92, dashArray: '7 9'
     }));
   }
   for (const parking of airport.parking ?? []) {
     add(L.circleMarker([parking.lat, parking.lon], {
       renderer: groundRenderer, pane: 'groundPane', interactive: false,
-      radius: 3.5, color: '#1b2530', weight: 1, fillColor: '#ffd34d', fillOpacity: 1
+      radius: 3.5, color: mapPalette.ground.standRing, weight: 1, fillColor: mapPalette.ground.stand, fillOpacity: 1
     }));
   }
   addGroundLabels(airport);
@@ -1677,8 +1916,13 @@ setInterval(() => {
   if (!lastTelemetry) return;
   const seconds = Math.max(0, Math.floor((Date.now() - lastTelemetry.receivedAt) / 1000));
   $('#ageDiagnostic').textContent = `${seconds} 秒前`;
-  if (seconds > 3 && socket?.readyState === WebSocket.OPEN) setStatus('lost', 'UDP 数据超时');
+  if (seconds > 3 && socket?.readyState === WebSocket.OPEN) setStatus('lost', statusText('lost', dataSource.isTrain));
 }, 1000);
 
 if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('/sw.js').catch(() => {});
-bootstrap().catch(() => showToast('无法读取应用配置'));
+bootstrap().catch((error) => {
+  // Never fail silently: a broken start-up used to leave the page looking alive
+  // but unresponsive, with no hint about which call went wrong.
+  console.error('EFB 启动失败', error);
+  showToast('无法读取应用配置');
+});

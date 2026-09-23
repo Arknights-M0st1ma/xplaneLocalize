@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-  <meta name="theme-color" content="#0a1118">
+  <meta name="theme-color" content="#ffffff">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="XP EFB">
@@ -14,161 +14,354 @@
   <link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
   <!-- The version query keeps iPad Safari (and the service worker cache) from
        pairing a freshly fetched index.html with an older app bundle. -->
-  <link rel="stylesheet" href="/styles.css?v=25">
+  <link rel="stylesheet" href="/styles.css?v=28">
 </head>
 <body>
-  <!-- The map area shrinks when the sidebar is open, so the sidebar never covers
-       the map and every map gesture keeps working. -->
-  <div id="stage">
-    <div id="mapRotator"><main id="map" aria-label="移动地图"></main></div>
+  <!-- Left rail. Collapsed it is just the logo and the four page icons; expanded
+       it carries the functional interface of the selected page. -->
+  <nav id="rail" class="rail" aria-label="主导航">
+    <div class="rail-head">
+      <span class="rail-logo" aria-label="X-Plane EFB">EFB</span>
+      <button id="railToggle" class="rail-toggle" aria-label="展开或收缩侧边栏" aria-expanded="true">‹</button>
+    </div>
+    <div class="rail-nav" role="tablist" aria-label="页面">
+      <button class="rail-item" type="button" data-page="map" aria-current="page" title="地图">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3 3 5.5v15L9 18l6 3 6-2.5v-15L15 6 9 3Zm0 0v15m6-12v15"/></svg>
+        <span>地图</span>
+      </button>
+      <button class="rail-item" type="button" data-page="plan" title="计划">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h10"/></svg>
+        <span>计划</span>
+      </button>
+      <button class="rail-item" type="button" data-page="manual" title="手册">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v18H6.5A2.5 2.5 0 0 0 4 22V4.5Zm0 0A2.5 2.5 0 0 0 6.5 7H20"/></svg>
+        <span>手册</span>
+      </button>
+      <button class="rail-item" type="button" data-page="settings" title="设置">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M4.5 12h-2.7M22.2 12H19.5M6.2 6.2 4.3 4.3M19.7 19.7l-1.9-1.9M17.8 6.2l1.9-1.9M4.3 19.7l1.9-1.9"/></svg>
+        <span>设置</span>
+      </button>
+    </div>
 
-    <header class="topbar glass">
-      <div class="brand"><span class="brand-mark">XP</span><span>PORTABLE EFB</span></div>
-      <div id="status" class="status waiting"><span class="status-dot"></span><span id="statusText">等待数据</span></div>
-      <button id="menuButton" class="icon-button" aria-label="展开或收起侧边栏">☰</button>
-    </header>
+    <div class="rail-panel">
+      <!-- ------------------------------------------------ 地图页：图层与显示 -->
+      <section class="rail-pane" data-pane="map">
+        <div class="drawer-section">
+          <h2>底图</h2>
+          <label class="row"><span>OpenStreetMap</span><input type="radio" name="base" value="osm" checked></label>
+          <label id="customBaseMapRow" class="row hidden"><span id="customBaseMapName">自定义底图</span><input type="radio" name="base" value="custom"></label>
+          <label class="row"><span>夜间模式<small>深色底图与深色界面</small></span><input id="nightToggle" type="checkbox"></label>
+          <p class="section-note">自定义 XYZ 底图需自行获得授权。</p>
+        </div>
+        <div class="drawer-section">
+          <h2>显示</h2>
+          <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
+          <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
+          <label class="row" id="routeToggleRow"><span>SimBrief 航路</span><input id="routeToggle" type="checkbox" checked></label>
+          <div class="field" id="aircraftIconRow">
+            <span class="field-caption">飞机图标</span>
+            <select id="aircraftIcon" aria-label="飞机图标样式">
+              <option value="modern">现代客机（默认）</option>
+              <option value="arrow">简约箭头</option>
+              <option value="classic">经典三角</option>
+            </select>
+          </div>
+          <div class="field" id="trackOptionRow">
+            <span class="field-caption">航迹保留</span>
+            <select id="trackOption" aria-label="航迹保留策略">
+              <option value="forever">永久保留（自动抽稀）</option>
+              <option value="hours6">最近 6 小时</option>
+              <option value="hours1">最近 1 小时</option>
+              <option value="points50000">最近 50 000 个点</option>
+              <option value="points10000">最近 10 000 个点</option>
+              <option value="points2000">最近 2 000 个点</option>
+            </select>
+          </div>
+          <p id="trackSummary" class="section-note">—</p>
+        </div>
+      </section>
 
-    <section class="instruments glass" aria-label="Flight data">
-      <div class="instrument"><span>GS</span><strong id="gs">—</strong><small>KT</small></div>
-      <div class="instrument"><span>ALT</span><strong id="alt">—</strong><small>FT MSL</small></div>
-      <div class="instrument"><span>HDG</span><strong id="hdg">—</strong><small>TRUE</small></div>
-      <div class="instrument optional"><span>V/S</span><strong id="vs">—</strong><small>FPM</small></div>
-    </section>
+      <!-- ------------------------------------------------------- 手册页 -->
+      <section class="rail-pane hidden" data-pane="manual">
+        <div class="drawer-section">
+          <h2>手册库</h2>
+          <div class="field">
+            <input id="manualFilter" class="text-input" type="search" placeholder="按名称筛选…" aria-label="筛选手册">
+          </div>
+          <button id="manualRefreshButton" class="secondary-button" type="button">重新扫描文件夹</button>
+          <p id="manualStatus" class="section-note">读取中…</p>
+          <div id="manualList" class="manual-list" role="list"></div>
+        </div>
+      </section>
 
-    <section id="flightOverlay" class="flight-overlay glass" aria-label="航班状态">
-      <header class="fo-head" id="flightDragHandle">
-        <span id="foAirline" class="fo-airline hidden">
-          <img id="foAirlineLogo" class="fo-airline-logo hidden" alt="" loading="lazy">
-          <span id="foAirlineBadge" class="fo-airline-badge">—</span>
-        </span>
-        <span id="foCallsign" class="fo-callsign">—</span>
-        <span id="foAircraft" class="fo-aircraft">—</span>
-        <span class="fo-buttons">
-          <button id="foCollapseButton" class="fo-icon" aria-label="折叠或展开航班状态" title="折叠/展开">▾</button>
-          <button id="foHideButton" class="fo-icon" aria-label="隐藏航班状态" title="隐藏">✕</button>
-        </span>
+      <!-- ------------------------------------------------------- 计划页 -->
+      <section class="rail-pane hidden" data-pane="plan">
+        <div class="drawer-section simbrief-card" id="simbriefSection">
+          <h2>SimBrief 航路</h2>
+          <p id="simbriefStatus">尚未获取航路。</p>
+          <div id="planSelectRow" class="field hidden">
+            <select id="planSelect" aria-label="选择已归档的飞行计划"></select>
+          </div>
+          <button id="simbriefRefreshButton" class="primary-button" type="button">获取/刷新航路</button>
+          <button id="ofpButton" class="secondary-button" type="button">查看完整 OFP</button>
+          <dl id="simbriefSummary" class="summary hidden">
+            <dt>备降</dt><dd id="routeAlternates">—</dd>
+            <dt>航路</dt><dd id="routeString">—</dd>
+            <dt>航点</dt><dd id="routeWaypoints">—</dd>
+          </dl>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------- 设置页 -->
+      <section class="rail-pane hidden" data-pane="settings">
+        <div class="drawer-section">
+          <h2>电脑端设置</h2>
+          <p class="section-note">端口、数据源、SimBrief 账号、天气 Key、X-Plane 目录和手册文件夹都在电脑端托盘菜单的“设置…”里修改，保存后按提示重启服务即可。</p>
+        </div>
+        <div class="drawer-section">
+          <h2>本页快捷项</h2>
+          <label class="row"><span>飞行轨迹</span><input id="trackToggleMirror" type="checkbox" checked></label>
+          <label class="row"><span>夜间模式</span><input id="nightToggleMirror" type="checkbox"></label>
+          <p class="section-note">这两项与“地图”页里的开关是同一个设置。</p>
+        </div>
+      </section>
+    </div>
+  </nav>
+
+  <main id="main" class="main">
+    <!-- The map area shrinks when the rail is open, so the rail never covers the
+         map and every map gesture keeps working. -->
+    <div id="stage" data-page-panel="map">
+      <div id="mapRotator"><main id="map" aria-label="移动地图"></main></div>
+
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">EFB</span>
+          <span class="brand-text">
+            <b id="brandTitle">PORTABLE EFB</b>
+            <i id="brandSub">局域网移动地图 EFB</i>
+          </span>
+        </div>
+        <div id="status" class="status waiting"><span class="status-dot"></span><span id="statusText">等待数据</span></div>
+        <button id="menuButton" class="icon-button" aria-label="展开或收起侧边栏">☰</button>
       </header>
-      <div class="fo-body">
-        <div class="fo-leg">
-          <div class="leg-end">
-            <span id="foOrigin" class="leg-code">—</span>
-            <span id="foPlannedOff" class="leg-time">—</span>
-            <span class="leg-caption">计划离港 UTC</span>
+
+      <section class="instruments" aria-label="Flight data">
+        <div class="instrument"><span>GS</span><strong id="gs">—</strong><small id="gsUnit">KT</small></div>
+        <div class="instrument"><span id="altLabel">ALT</span><strong id="alt">—</strong><small id="altUnit">FT MSL</small></div>
+        <div class="instrument" id="hdgInstrument"><span>HDG</span><strong id="hdg">—</strong><small>TRUE</small></div>
+        <div class="instrument optional"><span id="vsLabel">V/S</span><strong id="vs">—</strong><small id="vsUnit">FPM</small></div>
+      </section>
+
+      <section id="flightOverlay" class="flight-overlay" aria-label="航班状态">
+        <header class="fo-head" id="flightDragHandle">
+          <span id="foAirline" class="fo-airline hidden">
+            <img id="foAirlineLogo" class="fo-airline-logo hidden" alt="" loading="lazy">
+            <span id="foAirlineBadge" class="fo-airline-badge">—</span>
+          </span>
+          <span id="foCallsign" class="fo-callsign">—</span>
+          <span id="foAircraft" class="fo-aircraft">—</span>
+          <span class="fo-buttons">
+            <button id="foCollapseButton" class="fo-icon" aria-label="折叠或展开航班状态" title="折叠/展开">▾</button>
+            <button id="foHideButton" class="fo-icon" aria-label="隐藏航班状态" title="隐藏">✕</button>
+          </span>
+        </header>
+        <div class="fo-body">
+          <div class="fo-leg">
+            <div class="leg-end">
+              <span id="foOrigin" class="leg-code">—</span>
+              <span id="foPlannedOff" class="leg-time">—</span>
+              <span class="leg-caption">计划离港 UTC</span>
+            </div>
+            <div class="leg-middle">
+              <span id="foEnroute" class="leg-enroute">—</span>
+              <span class="leg-arrow"></span>
+            </div>
+            <div class="leg-end">
+              <span id="foDestination" class="leg-code">—</span>
+              <span id="foPlannedOn" class="leg-time">—</span>
+              <span class="leg-caption">计划到达 UTC</span>
+            </div>
           </div>
-          <div class="leg-middle">
-            <span id="foEnroute" class="leg-enroute">—</span>
-            <span class="leg-arrow"></span>
+          <div class="fo-progress">
+            <span class="fo-bar"><span id="foBarFill"></span></span>
+            <span id="foProgress" class="fo-progress-text">—</span>
           </div>
-          <div class="leg-end">
-            <span id="foDestination" class="leg-code">—</span>
-            <span id="foPlannedOn" class="leg-time">—</span>
-            <span class="leg-caption">计划到达 UTC</span>
+          <dl class="fo-live">
+            <div><dt>剩余距离</dt><dd id="foRemaining">—</dd></div>
+            <div><dt>剩余时间</dt><dd id="foRemainingTime">—</dd></div>
+            <div><dt>预计到达</dt><dd id="foEta">—</dd><span id="foEtaDelta" class="eta-delta hidden"></span></div>
+            <div><dt>地速</dt><dd id="foGs">—</dd></div>
+            <div><dt>高度</dt><dd id="foAlt">—</dd></div>
+            <div><dt>航向</dt><dd id="foHdg">—</dd></div>
+            <div><dt>状态</dt><dd id="foPhase">—</dd></div>
+            <div><dt>更新</dt><dd id="foUpdated">—</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <div class="left-controls">
+        <button id="flightRestoreButton" class="weather-icon hidden" aria-label="显示航班状态" title="显示航班状态">✈</button>
+        <button id="trainToggle" class="weather-icon hidden" aria-label="列车状态" title="列车状态">🚆</button>
+        <button id="groundToggle" class="weather-icon" aria-pressed="false" aria-label="机场地面图层" title="机场地面图层（滑行道/标线/机位）">🛬</button>
+        <div id="weatherSwitcher" class="weather-switcher">
+          <div id="weatherSubIcons" class="weather-sub hidden" role="group" aria-label="天气图层"></div>
+          <button id="weatherToggle" class="weather-main" aria-expanded="false" aria-label="天气图层" title="天气图层">☁</button>
+          <label id="weatherOpacityRow" class="weather-opacity hidden" title="天气图层不透明度">
+            <input id="weatherOpacity" type="range" min="30" max="100" step="5" value="85" aria-label="天气图层不透明度">
+          </label>
+        </div>
+        <div class="zoom-control">
+          <button id="zoomInButton" type="button" aria-label="放大">＋</button>
+          <button id="zoomOutButton" type="button" aria-label="缩小">－</button>
+        </div>
+      </div>
+
+      <div class="map-actions">
+        <button id="followButton" class="map-button active" aria-pressed="true" title="跟随飞机">⌖<span>跟随</span></button>
+        <button id="headingUpButton" class="map-button" aria-pressed="false" title="让飞机航向始终朝向画面上方">↑<span>航向向上</span></button>
+        <button id="flightToggleButton" class="map-button" aria-pressed="true" title="显示或隐藏航班状态">✈<span>状态</span></button>
+        <button id="clearTrackButton" class="map-button" title="清除轨迹">↺<span>清轨迹</span></button>
+      </div>
+
+      <div id="mapAttribution" class="map-attribution"></div>
+
+      <!-- Train Sim World 6 status. Replaces the flight card, which needs a SimBrief plan the train
+           source does not have. Hidden entirely in X-Plane mode. -->
+      <section id="trainCard" class="flight-overlay hidden" aria-label="列车状态">
+        <header class="fo-head">
+          <span id="tcService" class="fo-callsign">—</span>
+          <span id="tcPhase" class="fo-aircraft">—</span>
+          <span class="fo-buttons">
+            <button id="tcHideButton" class="fo-icon" aria-label="隐藏列车状态" title="隐藏">✕</button>
+          </span>
+        </header>
+        <div class="fo-body">
+          <dl class="fo-live">
+            <div><dt>速度</dt><dd id="tcSpeed">—</dd></div>
+            <div><dt>当前限速</dt><dd id="tcLimit">—</dd></div>
+            <div><dt>下一限速</dt><dd id="tcNextLimit">—</dd></div>
+            <div><dt>距下一限速</dt><dd id="tcLimitDistance">—</dd></div>
+            <div><dt>前方信号</dt><dd id="tcSignal">—</dd></div>
+            <div><dt>距信号</dt><dd id="tcSignalDistance">—</dd></div>
+            <div><dt>坡度</dt><dd id="tcGradient">—</dd></div>
+            <div><dt>更新</dt><dd id="tcUpdated">—</dd></div>
+          </dl>
+        </div>
+      </section>
+    </div>
+
+    <!-- ------------------------------------------------------------- 手册页 -->
+    <section id="page-manual" class="page hidden" data-page-panel="manual" aria-label="手册">
+      <div class="manual-viewer">
+        <header class="manual-toolbar">
+          <div class="mt-group">
+            <button id="pdfPrev" class="mt-button" type="button" title="上一页（←）">‹</button>
+            <input id="pdfPageInput" class="mt-page" type="text" inputmode="numeric" value="1" aria-label="页码">
+            <span class="mt-total">/ <span id="pdfPageCount">–</span></span>
+            <button id="pdfNext" class="mt-button" type="button" title="下一页（→）">›</button>
+          </div>
+          <div class="mt-group">
+            <button id="pdfZoomOut" class="mt-button" type="button" title="缩小（-）">−</button>
+            <span id="pdfZoomLabel" class="mt-label">–</span>
+            <button id="pdfZoomIn" class="mt-button" type="button" title="放大（+）">＋</button>
+            <button id="pdfFitWidth" class="mt-button" type="button" title="适合宽度">适宽</button>
+            <button id="pdfFitPage" class="mt-button" type="button" title="整页显示">整页</button>
+            <button id="pdfRotate" class="mt-button" type="button" title="旋转 90°">旋转</button>
+          </div>
+          <div class="mt-group mt-search">
+            <input id="pdfSearch" class="mt-input" type="search" placeholder="在本手册中搜索…" aria-label="搜索手册内容">
+            <span id="pdfSearchStatus" class="mt-label"></span>
+            <button id="pdfSearchPrev" class="mt-button" type="button" title="上一个匹配（Shift+Enter）">↑</button>
+            <button id="pdfSearchNext" class="mt-button" type="button" title="下一个匹配（Enter）">↓</button>
+          </div>
+          <div class="mt-group mt-right">
+            <button id="pdfOutlineToggle" class="mt-button" type="button" aria-pressed="false" title="大纲 / 书签">大纲</button>
+            <button id="pdfThumbToggle" class="mt-button" type="button" aria-pressed="false" title="页面缩略图">缩略图</button>
+            <button id="pdfDownload" class="mt-button" type="button" title="下载这本手册">下载</button>
+          </div>
+        </header>
+        <div class="manual-body">
+          <aside id="pdfSide" class="manual-side hidden">
+            <div id="pdfOutline" class="pdf-outline" role="tree" aria-label="文档大纲"></div>
+            <div id="pdfThumbs" class="pdf-thumbs hidden" aria-label="页面缩略图"></div>
+          </aside>
+          <div id="pdfScroll" class="manual-scroll">
+            <div id="pdfPages" class="pdf-pages"></div>
           </div>
         </div>
-        <div class="fo-progress">
-          <span class="fo-bar"><span id="foBarFill"></span></span>
-          <span id="foProgress" class="fo-progress-text">—</span>
+        <div id="pdfEmpty" class="manual-empty">
+          <h2>手册</h2>
+          <p>在左侧列表里选一本 PDF。手册来自电脑端“设置… → 地图 → 手册文件夹”指定的目录，子文件夹也会列出。</p>
         </div>
-        <dl class="fo-live">
-          <div><dt>剩余距离</dt><dd id="foRemaining">—</dd></div>
-          <div><dt>剩余时间</dt><dd id="foRemainingTime">—</dd></div>
-          <div><dt>预计到达</dt><dd id="foEta">—</dd></div>
-          <div><dt>地速</dt><dd id="foGs">—</dd></div>
-          <div><dt>高度</dt><dd id="foAlt">—</dd></div>
-          <div><dt>航向</dt><dd id="foHdg">—</dd></div>
-          <div><dt>状态</dt><dd id="foPhase">—</dd></div>
-          <div><dt>更新</dt><dd id="foUpdated">—</dd></div>
-        </dl>
       </div>
     </section>
 
-    <div class="left-controls">
-      <button id="flightRestoreButton" class="weather-icon hidden" aria-label="显示航班状态" title="显示航班状态">✈</button>
-      <button id="groundToggle" class="weather-icon" aria-pressed="false" aria-label="机场地面图层" title="机场地面图层（滑行道/标线/机位）">🛬</button>
-      <div id="weatherSwitcher" class="weather-switcher">
-        <div id="weatherSubIcons" class="weather-sub hidden" role="group" aria-label="天气图层"></div>
-        <button id="weatherToggle" class="weather-main glass" aria-expanded="false" aria-label="天气图层" title="天气图层">☁</button>
-        <label id="weatherOpacityRow" class="weather-opacity hidden" title="天气图层不透明度">
-          <input id="weatherOpacity" type="range" min="30" max="100" step="5" value="85" aria-label="天气图层不透明度">
-        </label>
-      </div>
-      <div class="zoom-control glass">
-        <button id="zoomInButton" type="button" aria-label="放大">＋</button>
-        <button id="zoomOutButton" type="button" aria-label="缩小">－</button>
-      </div>
-    </div>
-
-    <div class="map-actions">
-      <button id="followButton" class="map-button active" aria-pressed="true" title="跟随飞机">⌖<span>跟随</span></button>
-      <button id="headingUpButton" class="map-button" aria-pressed="false" title="让飞机航向始终朝向画面上方">↑<span>航向向上</span></button>
-      <button id="flightToggleButton" class="map-button" aria-pressed="true" title="显示或隐藏航班状态">✈<span>状态</span></button>
-      <button id="clearTrackButton" class="map-button" title="清除轨迹">↺<span>清轨迹</span></button>
-    </div>
-
-    <div id="mapAttribution" class="map-attribution"></div>
-  </div>
-
-  <aside id="sidebar" class="sidebar">
-    <div class="sidebar-head">
-      <h1>图层与状态</h1>
-      <button id="closeButton" class="icon-button" aria-label="收起侧边栏">×</button>
-    </div>
-    <div class="sidebar-body">
-      <div class="drawer-section">
-        <h2>底图</h2>
-        <label class="row"><span>OpenStreetMap</span><input type="radio" name="base" value="osm" checked></label>
-        <label id="customBaseMapRow" class="row hidden"><span id="customBaseMapName">自定义底图</span><input type="radio" name="base" value="custom"></label>
-        <label class="row"><span>夜间模式<small>深色底图（仅对底图生效）</small></span><input id="nightToggle" type="checkbox"></label>
-        <p class="section-note">自定义 XYZ 底图需自行获得授权。</p>
-      </div>
-      <div class="drawer-section">
-        <h2>显示</h2>
-        <label class="row"><span>飞行轨迹</span><input id="trackToggle" type="checkbox" checked></label>
-        <label class="row"><span>飞机数据</span><input id="aircraftToggle" type="checkbox" checked></label>
-        <label class="row"><span>SimBrief 航路</span><input id="routeToggle" type="checkbox" checked></label>
-        <div class="field">
-          <span class="field-caption">飞机图标</span>
-          <select id="aircraftIcon" aria-label="飞机图标样式">
-            <option value="modern">现代客机（默认）</option>
-            <option value="arrow">简约箭头</option>
-            <option value="classic">经典三角</option>
-          </select>
+    <!-- ------------------------------------------------------------- 计划页 -->
+    <section id="page-plan" class="page hidden" data-page-panel="plan" aria-label="飞行计划">
+      <div class="doc-page">
+        <header class="doc-head">
+          <div>
+            <h1 id="planTitle">飞行计划</h1>
+            <p id="planSubtitle" class="section-note">尚未获取航路。</p>
+          </div>
+          <div id="planTimes" class="plan-times"></div>
+        </header>
+        <div id="planCards" class="plan-cards"></div>
+        <div class="plan-grid">
+          <section class="doc-card">
+            <h2>航段 <span class="plan-head-en">Legs</span> <span id="planLegCount" class="plan-count"></span></h2>
+            <div class="plan-table-wrap"><table class="plan-table" id="planTable"></table></div>
+          </section>
+          <section class="doc-card">
+            <h2>载重与燃油 <span class="plan-head-en">Load &amp; Fuel</span> <span id="planUnits" class="plan-count"></span></h2>
+            <div id="planLoad" class="plan-load"></div>
+            <div id="planExtra" class="plan-load"></div>
+          </section>
         </div>
-        <div class="field">
-          <span class="field-caption">航迹保留</span>
-          <select id="trackOption" aria-label="航迹保留策略">
-            <option value="forever">永久保留（自动抽稀）</option>
-            <option value="hours6">最近 6 小时</option>
-            <option value="hours1">最近 1 小时</option>
-            <option value="points50000">最近 50 000 个点</option>
-            <option value="points10000">最近 10 000 个点</option>
-            <option value="points2000">最近 2 000 个点</option>
-          </select>
+        <p id="planEmpty" class="section-note">用左侧的“获取/刷新航路”从 SimBrief 拉取最新计划。</p>
+      </div>
+    </section>
+
+    <!-- ------------------------------------------------------------- 设置页 -->
+    <section id="page-settings" class="page hidden" data-page-panel="settings" aria-label="设置">
+      <div class="doc-page">
+        <header class="doc-head">
+          <div>
+            <h1>设置与状态</h1>
+            <p class="section-note">连接端口、数据源、SimBrief 账号、天气 Key、X-Plane 目录与手册文件夹都在电脑端托盘菜单的“设置…”里修改。这里是本页看到的状态。</p>
+          </div>
+        </header>
+        <div class="settings-grid">
+          <section class="doc-card">
+            <h2>数据链路</h2>
+            <dl class="kv">
+              <dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd>
+              <dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd>
+              <dt id="groundDiagnosticLabel">地面图层</dt><dd id="groundDiagnostic">—</dd>
+              <dt>最后更新</dt><dd id="ageDiagnostic">—</dd>
+            </dl>
+          </section>
+          <section class="doc-card">
+            <h2>手册库</h2>
+            <dl class="kv">
+              <dt>文件夹</dt><dd id="manualFolderInfo">—</dd>
+              <dt>可用手册</dt><dd id="manualCountInfo">—</dd>
+            </dl>
+          </section>
+          <section class="doc-card">
+            <h2>本页</h2>
+            <dl class="kv">
+              <dt>界面版本</dt><dd id="appVersionInfo">v28</dd>
+              <dt>数据源</dt><dd id="sourceNameInfo">—</dd>
+              <dt>航迹点</dt><dd id="trackPointsInfo">—</dd>
+            </dl>
+          </section>
         </div>
-        <p id="trackSummary" class="section-note">—</p>
+        <p class="disclaimer">仅用于模拟飞行/模拟驾驶娱乐，不得用于真实导航或真实铁路调度。</p>
       </div>
-      <div class="drawer-section simbrief-card">
-        <h2>SimBrief 航路</h2>
-        <p id="simbriefStatus">尚未获取航路。</p>
-        <div id="planSelectRow" class="field hidden">
-          <select id="planSelect" aria-label="选择已归档的飞行计划"></select>
-        </div>
-        <button id="simbriefRefreshButton" class="primary-button" type="button">获取/刷新航路</button>
-        <button id="ofpButton" class="secondary-button" type="button">查看完整 OFP</button>
-        <dl id="simbriefSummary" class="summary hidden">
-          <dt>备降</dt><dd id="routeAlternates">—</dd>
-          <dt>航路</dt><dd id="routeString">—</dd>
-          <dt>航点</dt><dd id="routeWaypoints">—</dd>
-        </dl>
-      </div>
-      <div class="drawer-section diagnostics">
-        <h2>数据链路</h2>
-        <dl><dt>WebSocket</dt><dd id="wsDiagnostic">连接中</dd><dt>UDP 来源</dt><dd id="sourceDiagnostic">—</dd><dt>地面图层</dt><dd id="groundDiagnostic">—</dd><dt>最后更新</dt><dd id="ageDiagnostic">—</dd></dl>
-      </div>
-      <p class="disclaimer">仅用于飞行模拟，不得用于真实导航。</p>
-    </div>
-    <div id="sidebarResizer" class="sidebar-resizer" role="separator" aria-label="调整侧边栏宽度"></div>
-  </aside>
+    </section>
+  </main>
 
   <div id="scrim" class="scrim"></div>
   <div id="toast" class="toast" role="status"></div>
@@ -187,6 +380,6 @@
   </section>
 
   <script src="/vendor/leaflet/leaflet.js"></script>
-  <script type="module" src="/app.js?v=25"></script>
+  <script type="module" src="/app.js?v=28"></script>
 </body>
 </html>

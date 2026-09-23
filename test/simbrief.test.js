@@ -54,6 +54,62 @@ test('normalises a SimBrief OFP for the map', () => {
   assert.equal(plan.waypoints[4].type, 'ndb');
 });
 
+test('carries weights, fuel and cruise figures for the plan page', () => {
+  const plan = parseFlightPlan(fixture);
+  assert.equal(plan.units, 'KGS');
+  assert.equal(plan.weight.pax, 268);
+  assert.equal(plan.weight.bags, 300);
+  // The planned weights are est_* and the aircraft limits are max_* in a real
+  // json=v2 OFP; reading zfw/tow/ldw/mtow/mlw returned null for every pilot.
+  assert.equal(plan.weight.zfw, 207100);
+  assert.equal(plan.weight.tow, 268400);
+  assert.equal(plan.weight.lw, 221800);
+  assert.equal(plan.weight.ramp, 270600);
+  assert.equal(plan.weight.maxZfw, 212000);
+  assert.equal(plan.weight.maxTow, 275000);
+  assert.equal(plan.weight.maxLw, 233000);
+  assert.equal(plan.weight.oew, 178500);
+  // plan_ramp is the fuel on the ramp (block fuel), plan_takeoff is what is left
+  // when the brakes are released.
+  assert.equal(plan.fuel.block, 61620);
+  assert.equal(plan.fuel.takeoff, 61300);
+  assert.equal(plan.fuel.landing, 8300);
+  assert.equal(plan.fuel.enroute, 48700);
+  assert.equal(plan.fuel.reserve, 6900);
+  assert.equal(plan.fuel.alternate, 2600);
+  assert.equal(plan.fuel.avgFlow, 4346);
+  assert.equal(plan.cruise.mach, 0.82);
+  assert.equal(plan.cruise.tas, 481);
+  assert.equal(plan.cruise.costIndex, 35);
+  assert.equal(plan.cruise.airDistanceNm, 854);
+  assert.equal(plan.cruise.greatCircleNm, 792);
+});
+
+test('a payload without weights or fuel still parses', () => {
+  const bare = { ...fixture, params: {}, weights: undefined, fuel: undefined };
+  const plan = parseFlightPlan(bare);
+  assert.equal(plan.weight.pax, null);
+  assert.equal(plan.fuel.block, null);
+  assert.equal(plan.units, '');
+});
+
+test('the shorter weight names are still accepted', () => {
+  // Older / alternate shapes use zfw, tow, ldw and mtow, mlw, mzfw.
+  const legacy = {
+    ...fixture,
+    params: {},
+    weights: { units: 'lbs', zfw: '100', tow: '200', ldw: '150', mzfw: '110', mtow: '210', mlw: '160' }
+  };
+  const plan = parseFlightPlan(legacy);
+  assert.equal(plan.units, 'LBS');
+  assert.equal(plan.weight.zfw, 100);
+  assert.equal(plan.weight.tow, 200);
+  assert.equal(plan.weight.lw, 150);
+  assert.equal(plan.weight.maxZfw, 110);
+  assert.equal(plan.weight.maxTow, 210);
+  assert.equal(plan.weight.maxLw, 160);
+});
+
 test('falls back to navlog fixes when an airport has no position', () => {
   const plan = parseFlightPlan({ origin: { icao_code: 'ZSPD' }, destination: { icao_code: 'RJAA' }, navlog: { fix: fixture.navlog.fix.slice(1, 6) } });
   assert.equal(plan.origin.lat, 31.45);

@@ -1,5 +1,6 @@
 using Microsoft.Win32;
 using System.Net.NetworkInformation;
+using System.Text.Json.Nodes;
 
 namespace XPlaneEfbBridge;
 
@@ -47,7 +48,11 @@ internal static class AutoStart
 // window. They are not part of the normal user workflow.
 internal static class ConfigSelfTest
 {
-    public static int Run(string directory)
+    public static int Run(string directory) => RunAsync(directory).GetAwaiter().GetResult();
+
+    // The TSW section below is asynchronous (it can talk to test/tsw-fake-api.js over HTTP), so the
+    // body lives here while Run keeps its synchronous signature for the console host.
+    private static async Task<int> RunAsync(string directory)
     {
         var lines = new List<string>();
         var ok = true;
@@ -211,6 +216,82 @@ internal static class ConfigSelfTest
         Check("HH:MM:SS 时长换算为秒", flightCard?["plannedEnrouteSeconds"]?.GetValue<double?>() == 35220
             && flightCard?["estimatedEnrouteSeconds"]?.GetValue<double?>() == 40373 && withFlight?["eteSeconds"]?.GetValue<double?>() == 40373);
         Check("生成时间解析", flightCard?["generatedAt"]?.GetValue<string>() == "2026-09-10T22:01:06Z");
+
+        // 10c. Plan-page detail: weights, fuel and cruise figures.
+        var withLoad = SimBriefClient.Parse(Ofp(positioned,
+            // The real json=v2 shape: the unit sits on params, the planned weights
+            // are est_* and the aircraft limits are max_*.
+            "\"params\":{\"units\":\"kgs\"},"
+            + "\"weights\":{\"pax_count\":\"268\",\"bag_count\":\"300\",\"payload\":\"28600\",\"oew\":\"178500\","
+            + "\"est_zfw\":\"207100\",\"est_tow\":\"268400\",\"est_ldw\":\"221800\",\"est_ramp\":\"270600\","
+            + "\"max_zfw\":\"212000\",\"max_tow\":\"275000\",\"max_ldw\":\"233000\"},"
+            + "\"fuel\":{\"plan_ramp\":\"61620\",\"plan_takeoff\":\"61300\",\"plan_landing\":\"8300\",\"enroute_burn\":\"48700\",\"reserve\":\"6900\",\"avg_fuel_flow\":\"4346\"},"
+            + "\"general\":{\"cruise_mach\":\"0.82\",\"cruise_tas\":\"481\",\"costindex\":\"35\",\"air_distance\":\"854\",\"gc_distance\":\"792\"}"));
+        Check("计划页重量字段", withLoad?["weight"]?["pax"]?.GetValue<double?>() == 268
+            && withLoad?["weight"]?["tow"]?.GetValue<double?>() == 268400
+            && withLoad?["weight"]?["maxTow"]?.GetValue<double?>() == 275000
+            && withLoad?["weight"]?["zfw"]?.GetValue<double?>() == 207100
+            && withLoad?["weight"]?["lw"]?.GetValue<double?>() == 221800
+            && withLoad?["units"]?.GetValue<string>() == "KGS");
+        Check("计划页油量字段", withLoad?["fuel"]?["block"]?.GetValue<double?>() == 61620
+            && withLoad?["fuel"]?["takeoff"]?.GetValue<double?>() == 61300
+            && withLoad?["fuel"]?["landing"]?.GetValue<double?>() == 8300
+            && withLoad?["fuel"]?["enroute"]?.GetValue<double?>() == 48700
+            && withLoad?["fuel"]?["reserve"]?.GetValue<double?>() == 6900);
+        Check("计划页短字段名仍可读", SimBriefClient.Parse(Ofp(positioned,
+            "\"weights\":{\"units\":\"lbs\",\"zfw\":\"100\",\"tow\":\"200\",\"ldw\":\"150\",\"mzfw\":\"110\",\"mtow\":\"210\"}"))
+            is { } legacy
+            && legacy["weight"]?["zfw"]?.GetValue<double?>() == 100
+            && legacy["weight"]?["maxTow"]?.GetValue<double?>() == 210
+            && legacy["units"]?.GetValue<string>() == "LBS");
+        Check("计划页巡航字段", withLoad?["cruise"]?["mach"]?.GetValue<double?>() == 0.82
+            && withLoad?["cruise"]?["tas"]?.GetValue<double?>() == 481
+            && withLoad?["cruise"]?["costIndex"]?.GetValue<double?>() == 35);
+        Check("缺少重量/油量时字段为 null", emptyNavlog?["weight"]?["tow"] is null && emptyNavlog?["fuel"]?["block"] is null);
+
+        // 10d. Manual library: listing, path safety, and PDF-only serving.
+        var manualRoot = Path.Combine(directory, "manuals");
+        Directory.CreateDirectory(Path.Combine(manualRoot, "空客"));
+        File.WriteAllText(Path.Combine(manualRoot, "A320 FCOM.pdf"), "x");
+        File.WriteAllText(Path.Combine(manualRoot, "notes.txt"), "x");
+        File.WriteAllText(Path.Combine(manualRoot, "空客", "A320 QRH.pdf"), "x");
+        var manualListing = Manuals.List(manualRoot);
+        Check("手册列表递归含子目录", (manualListing["files"] as System.Text.Json.Nodes.JsonArray)?.Count == 2,
+            manualListing["files"]?.ToJsonString() ?? "");
+        Check("手册列表忽略非 PDF", !(manualListing["files"]?.ToJsonString() ?? "").Contains("notes"));
+        Check("手册列表带路径与大小", (manualListing["files"]?[0]?["size"]?.GetValue<long>() ?? 0) > 0);
+        Check("手册路径拒绝目录穿越",
+            Manuals.FilePath(manualRoot, "../notes.txt") is null
+            && Manuals.FilePath(manualRoot, "sub/../../x.pdf") is null
+            && Manuals.FilePath(manualRoot, "C:/windows/win.ini") is null
+            && Manuals.ResolveInside(manualRoot, "a\0b.pdf") is null);
+        Check("手册只能取 PDF", Manuals.FilePath(manualRoot, "notes.txt") is null);
+        Check("手册可取到文件", Manuals.FilePath(manualRoot, "空客/A320 QRH.pdf") is not null);
+        Check("未配置手册文件夹时列表为空", Manuals.List("")["configured"]?.GetValue<bool>() == false
+            && (Manuals.List("")["files"] as System.Text.Json.Nodes.JsonArray)?.Count == 0);
+        Check("手册文件夹不存在时报错", Manuals.List(Path.Combine(directory, "nope"))["error"] is not null);
+
+        // 11. Weather overlay plumbing (allow list, coordinate range, cache, budget).
+        // 10b. Flown-track recorder (the PC records, the page only reads).
+        var trackPath = Path.Combine(directory, "track.json");
+        var track = new TrackStore(trackPath);
+        Check("航迹首个位置入库", track.Record(31.14, 121.80, 0));
+        Check("航迹按最小间隔节流", !track.Record(31.14, 121.80, 400) && !track.Record(31.141, 121.80, 700) && track.Count == 1);
+        Check("航迹记录有效位移", track.Record(31.1483, 121.80, 2000) && track.Count == 2);
+        Check("航迹拒绝无效坐标",
+            !track.Record(0, 0, 9000) && !track.Record(double.NaN, 121, 9000) && !track.Record(91, 121, 9000) && track.Count == 2);
+        Check("航迹原地停留的心跳点", track.Record(31.1483, 121.80, 4000) == false && track.Record(31.1483, 121.80, 8000));
+        var incremental = track.Read(2000);
+        Check("航迹增量读取", incremental["replaced"]?.GetValue<bool>() == false
+            && (incremental["points"] as System.Text.Json.Nodes.JsonArray)?.Count == 1
+            && incremental["count"]?.GetValue<int>() == 3);
+        var everything = track.Read(null);
+        Check("航迹全量读取", everything["replaced"]?.GetValue<bool>() == true
+            && (everything["points"] as System.Text.Json.Nodes.JsonArray)?.Count == 3);
+        Check("航迹距离单位为海里", Math.Abs(TrackStore.NmBetween(31.1434, 121.8052, 35.7647, 140.3864) - 970) < 12);
+        Check("航迹落盘并可重新读入", track.Save(true) && File.Exists(trackPath) && new TrackStore(trackPath).Load() == 3);
+        Check("清空航迹", track.Clear() == 3 && track.Count == 0 && everything["count"]?.GetValue<int>() == 3);
+        Check("清空后旧游标要求整体替换", track.Read(2000)["replaced"]?.GetValue<bool>() == true);
 
         // 11. Weather overlay plumbing (allow list, coordinate range, cache, budget).
         Check("天气图层白名单", WeatherTiles.UpstreamName("clouds") == "clouds_new" && WeatherTiles.UpstreamName("../x") is null);
@@ -475,6 +556,156 @@ internal static class ConfigSelfTest
         for (var step = 0; step <= 40; step++) { var ms = step * 200; estimator.Feed(ms, 5000 + ms / 60.0); }
         Check("V/S：按高度推算 1000 fpm", Math.Abs((estimator.Value ?? 0) - 1000) < 150,
             (estimator.Value ?? double.NaN).ToString("0.#"));
+
+        // 15. TSW6 data source (v0.2.0).
+        //
+        // Everything here runs without the game. The field names come from third-party
+        // documentation, so the point of these checks is not "the API looks like this" but
+        // "a payload shaped like this, or a hostile variant of it, cannot break the bridge".
+        // test/tsw-fake-api.js serves the same shapes over HTTP for a full end-to-end run.
+        var tswFull = JsonNode.Parse("""
+        {
+          "geoLocation": { "latitude": 51.4704, "longitude": -0.4593 },
+          "currentServiceName": "1A23 London Paddington",
+          "playerProfileName": "Driver",
+          "currentTile": { "x": 128450, "y": 87321 }
+        }
+        """) as JsonObject;
+        var tswSpeed = JsonNode.Parse("""{ "Speed (ms)": 23.42 }""") as JsonObject;
+        var tswAid = JsonNode.Parse("""
+        {
+          "speedLimit": { "value": 16.6667 },
+          "nextSpeedLimit": { "value": 8.3333 },
+          "distanceToNextSpeedLimit": 1250.4,
+          "distanceToSignal": 380.0,
+          "gradient": 1.5,
+          "signalAspectClass": "Clear"
+        }
+        """) as JsonObject;
+
+        var tswFrame = TswMapper.Map(tswFull, tswSpeed, tswAid);
+        Check("TSW：位置解析", (double)tswFrame["latitude"] == 51.4704 && (double)tswFrame["longitude"] == -0.4593);
+        Check("TSW：m/s 换算成 km/h 与 kt",
+            Math.Abs((double)tswFrame["groundSpeedKmh"] - 84.3) < 0.05 && Math.Abs((double)tswFrame["groundSpeedKt"] - 45.5) < 0.05,
+            $"{tswFrame["groundSpeedKmh"]} km/h · {tswFrame["groundSpeedKt"]} kt");
+        Check("TSW：限速按 {value} 包装并换算",
+            (double)tswFrame["limitKmh"] == 60 && (double)tswFrame["nextLimitKmh"] == 30,
+            $"{tswFrame["limitKmh"]} / {tswFrame["nextLimitKmh"]} km/h");
+        Check("TSW：距离与坡度、信号",
+            (double)tswFrame["distanceToNextLimitM"] == 1250 && (double)tswFrame["gradient"] == 1.5
+            && (string)tswFrame["signalAspect"] == "Clear");
+        Check("TSW：车次与玩家名", (string)tswFrame["currentServiceName"] == "1A23 London Paddington");
+        Check("TSW：协议标记", (string)tswFrame["protocol"] == TswMapper.Protocol && tswFrame.ContainsKey("receivedAt"));
+        // The map must not receive an altitude or a heading from the train source: the API has no
+        // such field, and a leftover value from a previous X-Plane session would look live.
+        Check("TSW：不产生高度/航向字段",
+            !tswFrame.ContainsKey("altitudeMslFt") && !tswFrame.ContainsKey("headingTrueDeg") && !tswFrame.ContainsKey("verticalSpeedFpm"));
+
+        // Hostile variants: renamed, missing, sentinel and out-of-range values.
+        var tswRenamed = JsonNode.Parse("""{ "lat": 51.5, "lon": -0.4 }""") as JsonObject;
+        var renamedFrame = TswMapper.Map(tswRenamed, JsonNode.Parse("""{ "Speed": 10 }""") as JsonObject, null);
+        Check("TSW：字段改名仍可用", renamedFrame.Count > 0 && (double)renamedFrame["latitude"] == 51.5
+            && Math.Abs((double)renamedFrame["groundSpeedKmh"] - 36) < 0.05);
+
+        var sentinel = JsonNode.Parse("""{ "geoLocation": { "latitude": 3.4028e+38, "longitude": 3.4028e+38 } }""") as JsonObject;
+        Check("TSW：哨兵值不当地址", TswMapper.Map(sentinel, null, null).Count == 0, "3.4028e+38 表示未定义");
+        var outOfRange = JsonNode.Parse("""{ "geoLocation": { "latitude": 91.0, "longitude": 200.0 } }""") as JsonObject;
+        Check("TSW：越界坐标被拒绝", TswMapper.Map(outOfRange, null, null).Count == 0);
+        var noCoordinates = JsonNode.Parse("""{ "currentServiceName": "x" }""") as JsonObject;
+        Check("TSW：没有坐标就不出帧", TswMapper.Map(noCoordinates, tswSpeed, null).Count == 0, "地图不会被拖到 (0,0)");
+        var absurdLimit = JsonNode.Parse("""{ "speedLimit": { "value": 200.0 } }""") as JsonObject;
+        Check("TSW：荒唐限速被丢弃", !TswMapper.Map(tswFull, null, absurdLimit).ContainsKey("limitKmh"), "200 m/s = 720 km/h");
+        Check("TSW：空字符串字段视为缺失",
+            TswMapper.Find(JsonNode.Parse("""{ "a": "", "b": 5 }""") as JsonObject, ["a", "b"])?.GetValue<int>() == 5);
+
+        // Switch hygiene: Publish merges into a snapshot that never shrinks, so the previous
+        // source's fields have to be dropped explicitly or the old altitude survives.
+        var switchServer = new LocalWebServer(new BridgeConfig());
+        switchServer.Publish(new Dictionary<string, object> { ["altitudeMslFt"] = 12000f, ["protocol"] = "DATA" });
+        switchServer.Publish(new Dictionary<string, object> { ["latitude"] = 51.5, ["protocol"] = TswMapper.Protocol });
+        Check("数据源切换前：旧字段确实会残留", switchServer.SnapshotForTest().ContainsKey("altitudeMslFt"), "这正是 ClearSnapshot 要解决的");
+        switchServer.ClearSnapshot();
+        switchServer.Publish(new Dictionary<string, object> { ["latitude"] = 51.5, ["protocol"] = TswMapper.Protocol });
+        var afterClear = switchServer.SnapshotForTest();
+        Check("ClearSnapshot 后旧字段不再出现", !afterClear.ContainsKey("altitudeMslFt") && !afterClear.ContainsKey("verticalSpeedFpm")
+            && (string)afterClear["protocol"] == TswMapper.Protocol);
+
+        // Failure paths that must never throw, scored by Result, not by status code.
+        var badBase = new TswApiClient(null, "http://127.0.0.1:1");
+        Check("TSW：地址覆盖生效", badBase.BaseUrl == "http://127.0.0.1:1");
+        Check("TSW：非法地址回退默认值", TswApiClient.NormalizeBase("not a url", out var baseNote) == "http://127.0.0.1:31270" && baseNote.Length > 0);
+        Check("TSW：地址补全协议", TswApiClient.NormalizeBase("localhost:31270", out _) == "http://localhost:31270");
+        Check("TSW：尾斜杠被去掉", TswApiClient.NormalizeBase("http://127.0.0.1:31270/", out _) == "http://127.0.0.1:31270");
+
+        var deadPort = new TswApiClient(null, "http://127.0.0.1:1");
+        var deadResponse = deadPort.GetAsync("DriverAid", "PlayerInfo", CancellationToken.None).GetAwaiter().GetResult();
+        Check("TSW：连不上时不抛异常", !deadResponse.Ok && deadResponse.Message.Length > 0, deadResponse.Message);
+        var deadProbe = deadPort.ProbeAsync(CancellationToken.None).GetAwaiter().GetResult();
+        Check("TSW：探测报出不可达并给出原因", !deadProbe.TcpReachable && deadProbe.Summary.Contains("连不上"), deadProbe.Summary);
+        deadPort.Dispose();
+
+        var missingKey = Path.Combine(directory, "no-such-CommAPIKey.txt");
+        var keyless = new TswApiClient(missingKey, "http://127.0.0.1:1");
+        Check("TSW：缺少密钥时不发请求", keyless.Key() is null && !keyless.KeyConfigured);
+        Check("TSW：说明里带上找过的路径", keyless.StatusNote().Contains("找不到密钥文件"), keyless.StatusNote());
+        // The key must never leak: it is read into memory only, and this assertion is what stops a
+        // future change from printing it into the diagnostics shown in the settings window.
+        var keyFile = Path.Combine(directory, "CommAPIKey.txt");
+        File.WriteAllText(keyFile, "\uFEFF  SECRET-KEY-VALUE  \r\n");
+        var keyed = new TswApiClient(keyFile, "http://127.0.0.1:1");
+        Check("TSW：密钥文件被读取并去掉 BOM/空白", keyed.Key() == "SECRET-KEY-VALUE");
+        Check("TSW：诊断文本不含密钥", !keyed.Describe().Contains("SECRET-KEY-VALUE") && !keyed.StatusNote().Contains("SECRET-KEY-VALUE"),
+            keyed.Describe());
+        keyed.Dispose();
+
+        var tswConfig = new BridgeConfig { TelemetrySource = BridgeConfig.SourceTsw, TswPollHz = 99, TswApiUrl = "http://127.0.0.1:31270/" };
+        tswConfig.Normalize();
+        Check("TSW：配置归一化（频率夹紧、去尾斜杠）", tswConfig.TswPollHz == 4 && tswConfig.TswApiUrl == "http://127.0.0.1:31270" && tswConfig.UsesTsw);
+        var xpConfig = new BridgeConfig { TelemetrySource = "nonsense" };
+        xpConfig.Normalize();
+        Check("TSW：未知数据源回退 X-Plane", xpConfig.TelemetrySource == BridgeConfig.SourceXPlane && !xpConfig.UsesTsw);
+        Check("TSW：坏地址会告警", new BridgeConfig { TelemetrySource = BridgeConfig.SourceTsw, TswApiUrl = "127.0.0.1:31270" }
+            .Warnings().Any(text => text.Contains("TSW API 地址")), "缺少协议头，运行前就该提示");
+        Check("TSW：不存在的密钥路径会告警", new BridgeConfig { TswApiKeyPath = missingKey }
+            .Warnings().Any(text => text.Contains("密钥文件路径当前不存在")));
+
+        // End-to-end against the Node fake in test/tsw-fake-api.js. It is only run when the caller
+        // points us at it, because the normal self-test must stay offline.
+        var fakeBase = Environment.GetEnvironmentVariable("EFB_TSW_FAKE_BASE");
+        if (!string.IsNullOrWhiteSpace(fakeBase))
+        {
+            var fakeKeyPath = Path.Combine(directory, "fake-key.txt");
+            File.WriteAllText(fakeKeyPath, Environment.GetEnvironmentVariable("EFB_TSW_KEY") ?? "DTG-FAKE-KEY-0123456789ABCDEF");
+            using var fakeClient = new TswApiClient(fakeKeyPath, fakeBase);
+            var fakeProbe = fakeClient.ProbeAsync(CancellationToken.None).GetAwaiter().GetResult();
+            Check("TSW 假 API：探测成功", fakeProbe.TcpReachable && fakeProbe.ListOk, fakeProbe.Summary);
+            // /list and /info carry their payload at the JSON root, not under "Values". Reading only
+            // "Values" made both come back empty, so this is asserted explicitly.
+            Check("TSW 假 API：根节点清单可读", fakeProbe.Nodes.Count > 0, string.Join("、", fakeProbe.Nodes));
+            Check("TSW 假 API：/info 的 Meta 可读", fakeProbe.InfoAvailable && fakeProbe.GameName.Length > 0 && fakeProbe.Worker.Length > 0,
+                $"{fakeProbe.GameName} / {fakeProbe.Worker}");
+            Check("TSW 假 API：数字型 Meta 也能读出", fakeProbe.GameBuild.Length > 0, $"build {fakeProbe.GameBuild}");
+            var fakeEndpoints = fakeClient.ListEndpointsAsync("DriverAid", CancellationToken.None).GetAwaiter().GetResult();
+            Check("TSW 假 API：端点清单可读", fakeEndpoints.Count > 0, string.Join("、", fakeEndpoints));
+
+            var fakePosition = await fakeClient.GetAsync("DriverAid", "PlayerInfo", CancellationToken.None);
+            var fakeSpeed = await fakeClient.GetAsync("CurrentDrivableActor", "Function.HUD_GetSpeed", CancellationToken.None);
+            var fakeAid = await fakeClient.GetAsync("DriverAid", "Data", CancellationToken.None);
+            Check("TSW 假 API：Values 从 /get 读出", fakePosition.Ok && fakePosition.Values is not null && fakePosition.Root is not null);
+            var fakeFrame = TswMapper.Map(fakePosition.Values, fakeSpeed.Values, fakeAid.Values);
+            Check("TSW 假 API：位置与速度可读", (double)fakeFrame["latitude"] == 51.4704
+                && Math.Abs((double)fakeFrame["groundSpeedKmh"] - 84.3) < 0.05, $"{fakeFrame.GetValueOrDefault("groundSpeedKmh")} km/h");
+            Check("TSW 假 API：限速可读", fakeFrame.ContainsKey("limitKmh") && fakeFrame.ContainsKey("distanceToNextLimitM"));
+            Check("TSW 假 API：信号与车次可读", fakeFrame.ContainsKey("signalAspect") && fakeFrame.ContainsKey("currentServiceName"));
+
+            // Wrong key must be a clean, credential-free failure rather than an exception.
+            var wrongKeyPath = Path.Combine(directory, "wrong-key.txt");
+            File.WriteAllText(wrongKeyPath, "definitely-not-the-key");
+            using var wrongClient = new TswApiClient(wrongKeyPath, fakeBase);
+            var wrongResponse = wrongClient.GetAsync("DriverAid", "PlayerInfo", CancellationToken.None).GetAwaiter().GetResult();
+            Check("TSW 假 API：密钥错误时干净失败", !wrongResponse.Ok && wrongResponse.Status == 403, $"HTTP {wrongResponse.Status} {wrongResponse.ErrorCode}");
+            Check("TSW 假 API：错误信息里没有密钥", !wrongResponse.Message.Contains("definitely-not-the-key"), wrongResponse.Message);
+        }
 
         try { Directory.Delete(directory, true); } catch { }
         File.WriteAllText(Path.Combine(Path.GetTempPath(), "efb-config-selftest.log"), string.Join(Environment.NewLine, lines));

@@ -72,6 +72,11 @@ internal static class Program
             Environment.ExitCode = OfpDump.ParseFile(args[1], args[2]);
             return;
         }
+        if (args.Length >= 2 && args[0] == "--tsw-probe")
+        {
+            Environment.ExitCode = TswProbeDump.Run(args[1], args.Length > 2 ? args[2] : ConfigStore.DefaultPath);
+            return;
+        }
         ApplicationConfiguration.Initialize();
         // A second instance would start a second service on the same ports and
         // could write the same configuration file at the same time.
@@ -119,10 +124,31 @@ internal sealed class BridgeConfig
     // Optional airline logo URL template, e.g.
     // https://example.com/airlines/{icao}_200.png — empty means "badge only".
     public string AirlineLogoUrlTemplate { get; set; } = "";
+    // Folder of PDF manuals (checklists, FCOM, QRH...) served to the EFB reader.
+    // The iPad cannot read this PC's disk, so the bridge lists and streams them.
+    public string ManualFolder { get; set; } = "";
     // system = Windows proxy settings (including PAC, the default),
     // none = always direct, manual = the explicit host:port below.
     public string ProxyMode { get; set; } = ProxySystem;
     public string ProxyUrl { get; set; } = "";
+
+    // Which simulator feeds the map. "xp" is X-Plane 12 over UDP (the original mode);
+    // "tsw" reads Train Sim World 6 through its local HTTP API instead. The two are
+    // mutually exclusive on purpose: both write latitude/longitude/protocol into the same
+    // snapshot, so running them together would make the marker jump between sources.
+    public const string SourceXPlane = "xp";
+    public const string SourceTsw = "tsw";
+    public string TelemetrySource { get; set; } = SourceXPlane;
+    // TSW6 API base. Empty means the game's built-in http://127.0.0.1:31270.
+    public string TswApiUrl { get; set; } = "";
+    // Where to read the game-generated CommAPIKey.txt. Empty means "search the default
+    // Documents\My Games\TrainSimWorld6\Saved\Config locations".
+    public string TswApiKeyPath { get; set; } = "";
+    // Polling rate for the TSW API. The API has no push, and every poll becomes one
+    // WebSocket frame per viewer, so this is deliberately low by default.
+    public int TswPollHz { get; set; } = 4;
+
+    public bool UsesTsw => TelemetrySource == SourceTsw;
 
     public BridgeConfig Clone() => new()
     {
@@ -142,8 +168,13 @@ internal sealed class BridgeConfig
         XplanePath = XplanePath,
         GroundMinZoom = GroundMinZoom,
         AirlineLogoUrlTemplate = AirlineLogoUrlTemplate,
+        ManualFolder = ManualFolder,
         ProxyMode = ProxyMode,
-        ProxyUrl = ProxyUrl
+        ProxyUrl = ProxyUrl,
+        TelemetrySource = TelemetrySource,
+        TswApiUrl = TswApiUrl,
+        TswApiKeyPath = TswApiKeyPath,
+        TswPollHz = TswPollHz
     };
 
     // Fills in nulls from a hand edited file and clamps the proxy mode to a known
@@ -163,6 +194,7 @@ internal sealed class BridgeConfig
         WeatherProxyPassword ??= "";
         XplanePath = (XplanePath ?? "").Trim();
         AirlineLogoUrlTemplate = (AirlineLogoUrlTemplate ?? "").Trim();
+        ManualFolder = (ManualFolder ?? "").Trim();
         GroundMinZoom = GroundMinZoom is >= 10 and <= 19 ? GroundMinZoom : 15;
         WeatherProxyMode = (WeatherProxyMode ?? "").Trim().ToLowerInvariant() switch
         {
@@ -178,6 +210,14 @@ internal sealed class BridgeConfig
             ProxyManual => ProxyManual,
             _ => ProxySystem
         };
+        TelemetrySource = (TelemetrySource ?? "").Trim().ToLowerInvariant() switch
+        {
+            SourceTsw => SourceTsw,
+            _ => SourceXPlane
+        };
+        TswApiUrl = (TswApiUrl ?? "").Trim().TrimEnd('/');
+        TswApiKeyPath = (TswApiKeyPath ?? "").Trim();
+        TswPollHz = TswPollHz is >= 1 and <= 10 ? TswPollHz : 4;
     }
 
     // Only what the bridge needs in order to run. Everything else is reported as
@@ -227,11 +267,22 @@ internal sealed class BridgeConfig
             warnings.Add("天气代理填了用户名但没有可用的密码：请在设置里重新输入代理密码。");
         if (ContainsSecret(SimbriefApiUrl))
             warnings.Add("SimBrief 端点里带有疑似密钥参数，建议改用系统代理或自建代理，不要把长期密钥写进配置文件。");
+        if (TswApiUrl.Length > 0)
+        {
+            if (!Uri.TryCreate(TswApiUrl, UriKind.Absolute, out var tswUri) || tswUri.Scheme is not ("http" or "https"))
+                warnings.Add($"TSW API 地址“{TswApiUrl}”不是 http(s) 开头的完整地址，连接会失败。");
+            else if (ContainsSecret(TswApiUrl))
+                warnings.Add("TSW API 地址里带有疑似密钥或账号信息，建议留空使用默认的 127.0.0.1:31270。");
+        }
+        if (TswApiKeyPath.Length > 0 && !File.Exists(TswApiKeyPath))
+            warnings.Add($"TSW 密钥文件路径当前不存在：{TswApiKeyPath}（TSW 数据源会读不到密钥）。");
         return warnings;
     }
 
     public static bool ContainsSecret(string url) =>
-        url.Length > 0 && (url.Contains('@') || url.Contains("key=", StringComparison.OrdinalIgnoreCase) || url.Contains("token=", StringComparison.OrdinalIgnoreCase));
+        url.Length > 0 && (url.Contains('@') || url.Contains("key=", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("apikey=", StringComparison.OrdinalIgnoreCase)
+            || url.Contains("token=", StringComparison.OrdinalIgnoreCase));
 }
 
 internal sealed class TrayContext : ApplicationContext
@@ -314,6 +365,10 @@ internal sealed class TrayContext : ApplicationContext
         target.AirlineLogoUrlTemplate = source.AirlineLogoUrlTemplate;
         target.ProxyMode = source.ProxyMode;
         target.ProxyUrl = source.ProxyUrl;
+        target.TelemetrySource = source.TelemetrySource;
+        target.TswApiUrl = source.TswApiUrl;
+        target.TswApiKeyPath = source.TswApiKeyPath;
+        target.TswPollHz = source.TswPollHz;
     }
 
     // Picks up hand edits (and anything the settings window wrote) without
@@ -338,6 +393,12 @@ internal sealed class TrayContext : ApplicationContext
 
         var edited = form.Result;
         var portsChanged = edited.WebPort != config.WebPort || !edited.UdpPorts.SequenceEqual(config.UdpPorts);
+        // Switching data source (or moving either TSW endpoint) restarts the service: the old
+        // collector has to stop before the new one publishes, and the snapshot must be cleared so no
+        // field of the previous source survives into the new mode.
+        var sourceChanged = edited.TelemetrySource != config.TelemetrySource
+            || !string.Equals(edited.TswApiUrl, config.TswApiUrl, StringComparison.Ordinal)
+            || !string.Equals(edited.TswApiKeyPath, config.TswApiKeyPath, StringComparison.Ordinal);
         // Everything except the listening ports is read per use, so it applies now.
         config.SourceIp = edited.SourceIp;
         config.CustomBaseMapName = edited.CustomBaseMapName;
@@ -356,16 +417,20 @@ internal sealed class TrayContext : ApplicationContext
         config.AirlineLogoUrlTemplate = edited.AirlineLogoUrlTemplate;
         config.ProxyMode = edited.ProxyMode;
         config.ProxyUrl = edited.ProxyUrl;
+        config.TelemetrySource = edited.TelemetrySource;
+        config.TswApiUrl = edited.TswApiUrl;
+        config.TswApiKeyPath = edited.TswApiKeyPath;
+        config.TswPollHz = edited.TswPollHz;
         // Rebuild the airport index now rather than making the iPad wait: the
         // apt.dat read is the slow part of the ground layer.
         if (groundChanged) service?.PrepareGround();
 
-        if (portsChanged && form.RestartRequested)
+        if ((portsChanged || sourceChanged) && form.RestartRequested)
         {
             pendingRestart = false;
             _ = RestartAsync();
         }
-        else if (portsChanged)
+        else if (portsChanged || sourceChanged)
         {
             // The window already told the user; keep the tray honest about which
             // ports are actually listening right now.
@@ -504,6 +569,7 @@ internal sealed class BridgeService
     private readonly CancellationTokenSource stop = new();
     private readonly ConcurrentBag<UdpClient> sockets = [];
     private readonly LocalWebServer web;
+    private TswTelemetrySource? tsw;
     private long lastStatusTick;
     private int stopping;
     public event Action<string>? StatusChanged;
@@ -522,6 +588,7 @@ internal sealed class BridgeService
         if (Interlocked.Exchange(ref stopping, 1) != 0) return;
         stop.Cancel();
         foreach (var socket in sockets) socket.Dispose();
+        await StopTswAsync();
         await web.StopAsync();
     }
 
@@ -529,9 +596,43 @@ internal sealed class BridgeService
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(appToken, stop.Token);
         await web.StartAsync(linked.Token);
-        StatusChanged?.Invoke($"网页已启动 · UDP {string.Join(",", config.UdpPorts)}");
-        var listeners = config.UdpPorts.Distinct().Select(port => ListenAsync(port, linked.Token)).ToList();
-        try { await Task.WhenAll(listeners.Append(web.WaitAsync(linked.Token))); } catch (OperationCanceledException) { } catch (ObjectDisposedException) { }
+        // Lets /api/status and /api/tsw/status report the live polling state without the web layer
+        // holding a reference to the collector.
+        web.TswStatusProvider = TswStatus;
+        // Switching data source changes the meaning of every field in the snapshot, so the stale
+        // fields of the previous source are dropped before the new one starts publishing.
+        web.ClearSnapshot();
+        var sources = new List<Task>();
+        if (config.UsesTsw)
+        {
+            tsw = new TswTelemetrySource(config, web.Publish, StatusChanged);
+            tsw.Start();
+            StatusChanged?.Invoke($"TSW 数据源 · {TswEndpointLabel()} · {tsw.PollHz} Hz");
+        }
+        else
+        {
+            StatusChanged?.Invoke($"网页已启动 · UDP {string.Join(",", config.UdpPorts)}");
+            sources.AddRange(config.UdpPorts.Distinct().Select(port => ListenAsync(port, linked.Token)));
+        }
+        try { await Task.WhenAll(sources.Append(web.WaitAsync(linked.Token))); } catch (OperationCanceledException) { } catch (ObjectDisposedException) { }
+    }
+
+    private string TswEndpointLabel() =>
+        config.TswApiUrl.Length > 0 ? config.TswApiUrl : $"127.0.0.1:{TswApiClient.DefaultPort}";
+
+    /// <summary>Human-readable status line for the tray, shared by the UDP and TSW paths.</summary>
+    public string SourceLabel() => config.UsesTsw
+        ? $"TSW {TswEndpointLabel()} · {web.ViewerCount} 台设备"
+        : $"XP12 · UDP {string.Join(",", config.UdpPorts)} · {web.ViewerCount} 台设备";
+
+    public Dictionary<string, object>? TswStatus() => tsw?.Status();
+
+    public async Task StopTswAsync()
+    {
+        if (tsw is null) return;
+        await tsw.StopAsync();
+        tsw.Dispose();
+        tsw = null;
     }
 
     private async Task ListenAsync(int port, CancellationToken token)
@@ -819,6 +920,17 @@ internal sealed class SimBriefClient
         return null;
     }
 
+    /// <summary>First key that holds a number: SimBrief renames fields between shapes.</summary>
+    private static double? FirstNumber(JsonNode? node, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            var value = Number(Child(node, key));
+            if (value is not null) return value;
+        }
+        return null;
+    }
+
     // SimBrief normally reports decimal degrees but the XML variant also uses
     // hemisphere prefixes such as "N51.470000".
     private static double? Coordinate(JsonNode? node)
@@ -1022,6 +1134,8 @@ internal sealed class SimBriefClient
             || destination is not null && destination["lat"] is not null && destination["lon"] is not null;
         if (waypoints.Count == 0 && !positioned) return null;
         var general = Child(root, "general");
+        var weights = Child(root, "weights");
+        var fuel = Child(root, "fuel");
         return new JsonObject
         {
             ["origin"] = origin,
@@ -1032,6 +1146,51 @@ internal sealed class SimBriefClient
             ["cruiseAltitudeFt"] = Number(Child(general, "initial_altitude") ?? Child(general, "cruise_altitude")),
             ["distanceNm"] = Number(Child(general, "route_distance") ?? Child(general, "gc_distance")),
             ["eteSeconds"] = Duration(Text(Child(root, "times"), "est_time_enroute")),
+            // Weights, fuel and cruise figures for the plan page. SimBrief sends them
+            // as strings, and the unit ("kgs" / "lbs") rides on the request
+            // parameters rather than inside the weight block.
+            ["units"] = (Text(Child(root, "params"), "units") ?? Text(weights, "units") ?? Text(fuel, "units") ?? "").ToUpperInvariant(),
+            ["weight"] = new JsonObject
+            {
+                ["pax"] = Number(Child(weights, "pax_count")),
+                ["bags"] = Number(Child(weights, "bag_count")),
+                ["cargo"] = Number(Child(weights, "cargo")),
+                ["freight"] = Number(Child(weights, "freight_added")),
+                ["payload"] = Number(Child(weights, "payload")),
+                ["oew"] = Number(Child(weights, "oew")),
+                // A real OFP uses est_* for the planned weights and max_* for the
+                // aircraft limits; the short names are kept as a fallback.
+                ["zfw"] = FirstNumber(weights, "est_zfw", "zfw"),
+                ["tow"] = FirstNumber(weights, "est_tow", "tow"),
+                ["lw"] = FirstNumber(weights, "est_ldw", "ldw"),
+                ["ramp"] = FirstNumber(weights, "est_ramp", "ramp"),
+                ["maxZfw"] = FirstNumber(weights, "max_zfw", "mzfw"),
+                ["maxTow"] = FirstNumber(weights, "max_tow", "mtow"),
+                ["maxLw"] = FirstNumber(weights, "max_ldw", "mlw"),
+                ["towLimitCode"] = Text(weights, "tow_limit_code") ?? ""
+            },
+            ["fuel"] = new JsonObject
+            {
+                ["block"] = Number(Child(fuel, "plan_ramp")),
+                ["takeoff"] = Number(Child(fuel, "plan_takeoff")),
+                ["landing"] = Number(Child(fuel, "plan_landing")),
+                ["taxi"] = Number(Child(fuel, "taxi")),
+                ["enroute"] = Number(Child(fuel, "enroute_burn")),
+                ["contingency"] = Number(Child(fuel, "contingency")),
+                ["alternate"] = Number(Child(fuel, "alternate_burn")),
+                ["reserve"] = Number(Child(fuel, "reserve")),
+                ["extra"] = Number(Child(fuel, "extra")),
+                ["minTakeoff"] = Number(Child(fuel, "min_takeoff")),
+                ["avgFlow"] = Number(Child(fuel, "avg_fuel_flow"))
+            },
+            ["cruise"] = new JsonObject
+            {
+                ["mach"] = Number(Child(general, "cruise_mach")),
+                ["tas"] = Number(Child(general, "cruise_tas")),
+                ["costIndex"] = Number(Child(general, "costindex") ?? Child(general, "cost_index")),
+                ["airDistanceNm"] = Number(Child(general, "air_distance")),
+                ["greatCircleNm"] = Number(Child(general, "gc_distance"))
+            },
             ["flight"] = FlightInfo(root),
             ["waypoints"] = waypoints
         };
@@ -1044,6 +1203,7 @@ internal sealed class LocalWebServer
     private readonly SimBriefClient flightPlan;
     private readonly WeatherTiles weather = new();
     private readonly AptDat ground;
+    private readonly TrackStore track;
     private readonly ConcurrentDictionary<Guid, WebSocket> viewers = new();
     private readonly Channel<string> updates = Channel.CreateBounded<string>(new BoundedChannelOptions(8) { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true });
     private readonly VerticalSpeedEstimator verticalSpeed = new();
@@ -1054,6 +1214,9 @@ internal sealed class LocalWebServer
     private string? lastSender;
     private DateTimeOffset? lastPacketAt;
     public int ViewerCount => viewers.Count;
+    /// <summary>Set by BridgeService so the web layer can report TSW source state without
+    /// holding a reference to the polling loop itself.</summary>
+    public Func<Dictionary<string, object>?>? TswStatusProvider { get; set; }
     public LocalWebServer(BridgeConfig config)
     {
         this.config = config;
@@ -1061,6 +1224,9 @@ internal sealed class LocalWebServer
         // Reads config.XplanePath on every lookup, so changing the X-Plane folder
         // in the settings window takes effect without restarting the service.
         ground = new AptDat(() => config.XplanePath, Path.Combine(ConfigStore.DirectoryFor(ConfigStore.ActivePath), "apt-index.json"));
+        // The recorded track is the bridge's own copy of the flight; the page reads
+        // it back instead of recording its own (see TrackStore).
+        track = new TrackStore(Path.Combine(ConfigStore.DirectoryFor(ConfigStore.ActivePath), "track.json"));
     }
 
     public async Task StartAsync(CancellationToken token)
@@ -1084,8 +1250,22 @@ internal sealed class LocalWebServer
             // only needs to know whether it is configured and from which zoom.
             ground = GroundStatus(),
             airlineLogoUrlTemplate = config.AirlineLogoUrlTemplate,
+            manuals = new { configured = config.ManualFolder.Length > 0, folder = config.ManualFolder },
+            // Which simulator feeds this page. The front end switches units, icons and
+            // which panels make sense based on this, so it is part of the config payload
+            // rather than something guessed from the first telemetry frame.
+            telemetrySource = config.TelemetrySource,
             local = true
         }));
+        // TSW6 source diagnostics, used by the EFB drawer and the settings window.
+        app.MapGet("/api/tsw/status", () => {
+            var payload = new JsonObject
+            {
+                ["enabled"] = config.UsesTsw,
+                ["status"] = TswStatusProvider?.Invoke() is { } status ? JsonSerializer.SerializeToNode(status) : null
+            };
+            return Results.Text(payload.ToJsonString(), "application/json");
+        });
         // Ground layout of the airports (apt.dat): nearest to the aircraft.
         app.MapGet("/api/ground/nearest", (HttpContext context) => {
             var query = context.Request.Query;
@@ -1197,12 +1377,58 @@ internal sealed class LocalWebServer
         app.MapGet("/api/status", () => {
             Dictionary<string, object> snapshot;
             lock (stateLock) snapshot = new(state);
-            return Results.Json(new { udp = new { ports = config.UdpPorts, sourceIp = config.SourceIp.Length > 0 ? config.SourceIp : null }, stats = new { packets, parsed, lastSender, lastPacketAt }, viewers = viewers.Count, hasPosition = snapshot.ContainsKey("latitude") && snapshot.ContainsKey("longitude"), simbrief = flightPlan.Configured });
+            return Results.Json(new
+            {
+                source = config.TelemetrySource,
+                udp = new { ports = config.UdpPorts, sourceIp = config.SourceIp.Length > 0 ? config.SourceIp : null },
+                stats = new { packets, parsed, lastSender, lastPacketAt },
+                viewers = viewers.Count,
+                hasPosition = snapshot.ContainsKey("latitude") && snapshot.ContainsKey("longitude"),
+                // The UDP counters stay in the payload for both sources so an existing monitoring
+                // script keeps working; in TSW mode they simply stay at zero.
+                simbrief = flightPlan.Configured,
+                tsw = TswStatusProvider?.Invoke() is { } tswStatus ? JsonSerializer.SerializeToNode(tswStatus) : null
+            });
+        });
+        // The flown track lives on the PC; the EFB only reads it. GET is
+        // incremental when the page passes the newest point it already has, and
+        // DELETE is what the "清轨迹" button calls.
+        app.MapGet("/api/track", (HttpContext context) => {
+            var raw = context.Request.Query["since"].ToString();
+            long? since = long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
+            return Results.Text(track.Read(since).ToJsonString(), "application/json");
+        });
+        app.MapDelete("/api/track", () => Results.Json(new { ok = true, removed = track.Clear() }));
+        // Manual library: the PDFs live on this PC, so the bridge lists the folder
+        // and streams the files back. Kestrel's own range processing serves the
+        // byte ranges PDF.js asks for.
+        app.MapGet("/api/manuals", () => Results.Text(Manuals.List(config.ManualFolder).ToJsonString(), "application/json"));
+        app.MapGet("/api/manuals/file", (HttpContext context) => {
+            var path = Manuals.FilePath(config.ManualFolder, context.Request.Query["path"].ToString());
+            // Anything that is not a PDF inside the configured folder is a 404, not
+            // an error page: the reader only ever asks for what the listing offered.
+            return path is null
+                ? Results.Json(new { error = "找不到该手册" }, statusCode: 404)
+                : Results.File(path, "application/pdf", null, enableRangeProcessing: true);
         });
         app.Map("/ws", HandleWebSocket);
         app.MapMethods("/{**path}", ["GET", "HEAD"], ServeEmbedded);
         await app.StartAsync(token);
+        // A track recorded earlier (the same machine, an earlier run) is what
+        // "永久保留" means to the user, so it is read back at start-up.
+        track.Load();
         _ = BroadcastLoop(token);
+        _ = SaveTrackLoop(token);
+    }
+
+    private async Task SaveTrackLoop(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(20));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token)) track.Save();
+        }
+        catch (OperationCanceledException) { }
     }
 
     public Task WaitAsync(CancellationToken token) => app?.WaitForShutdownAsync(token) ?? Task.CompletedTask;
@@ -1214,6 +1440,7 @@ internal sealed class LocalWebServer
             try { socket.Abort(); socket.Dispose(); } catch { }
         }
         viewers.Clear();
+        track.Save(true);
         if (app is null) return;
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
         try { await app.StopAsync(timeout.Token); } catch (OperationCanceledException) { }
@@ -1232,10 +1459,41 @@ internal sealed class LocalWebServer
         lock (stateLock)
         {
             foreach (var item in telemetry) state[item.Key] = item.Value;
-            ApplyVerticalSpeed();
+            // The altitude-derived vertical speed only makes sense for the X-Plane source: the TSW
+            // frame carries no altitude at all, so running the estimator there would resample the
+            // same stale value and publish a fictional climb rate.
+            if (!config.UsesTsw) ApplyVerticalSpeed();
             snapshot = new(state);
         }
+        // Every frame that carries a position lengthens the recorded track,
+        // whatever the iPad is doing at the time. This is what stops a track from
+        // losing its middle when Safari is backgrounded.
+        if (snapshot.TryGetValue("latitude", out var rawLatitude) && snapshot.TryGetValue("longitude", out var rawLongitude)
+            && AsDouble(rawLatitude, out var latitude) && AsDouble(rawLongitude, out var longitude))
+        {
+            track.Record(latitude, longitude, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            track.Save();
+        }
         updates.Writer.TryWrite(JsonSerializer.Serialize(new { type = "telemetry", payload = snapshot }));
+    }
+
+    /// <summary>Read-only copy of the current telemetry snapshot (self-test only).</summary>
+    public Dictionary<string, object> SnapshotForTest()
+    {
+        lock (stateLock) return new(state);
+    }
+
+    /// <summary>Drops every field of the current snapshot (and the derived vertical-speed history),
+    /// so a data-source switch cannot leave the previous source's values looking live. Without this
+    /// the merge in <see cref="Publish"/> would keep an old altitude forever and the estimator above
+    /// would keep reporting a climb rate for it.</summary>
+    public void ClearSnapshot()
+    {
+        lock (stateLock)
+        {
+            state.Clear();
+            verticalSpeed.Reset();
+        }
     }
 
     // X-Plane reports -999 for values it cannot supply, and row 4 ("Mach, VVI,
@@ -1293,6 +1551,17 @@ internal sealed class LocalWebServer
         private bool hasValue;
 
         public double? Value => hasValue ? smoothed : null;
+
+        /// <summary>Forgets every sample. Used when the data source changes, so a leftover altitude
+        /// from the previous session cannot be mistaken for a fresh measurement.</summary>
+        public void Reset()
+        {
+            samples.Clear();
+            lastMs = -1;
+            lastFeet = 0;
+            smoothed = 0;
+            hasValue = false;
+        }
 
         public void Feed(long ms, double feet)
         {
@@ -1353,7 +1622,7 @@ internal sealed class LocalWebServer
         var id = Guid.NewGuid(); viewers[id] = socket;
         try
         {
-            await socket.SendAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { type = "hello", payload = new { local = true, udpPorts = config.UdpPorts } })), WebSocketMessageType.Text, true, context.RequestAborted);
+            await socket.SendAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { type = "hello", payload = new { local = true, udpPorts = config.UdpPorts, source = config.TelemetrySource } })), WebSocketMessageType.Text, true, context.RequestAborted);
             Dictionary<string, object> snapshot; lock (stateLock) snapshot = new(state);
             if (snapshot.Count > 0) await socket.SendAsync(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { type = "telemetry", payload = snapshot })), WebSocketMessageType.Text, true, context.RequestAborted);
             var buffer = new byte[256];
@@ -1465,6 +1734,10 @@ internal sealed class LocalWebServer
 
     private static readonly Dictionary<string, string> Mime = new(StringComparer.OrdinalIgnoreCase) {
         [".html"] = "text/html; charset=utf-8", [".js"] = "text/javascript; charset=utf-8", [".css"] = "text/css; charset=utf-8",
+        // ES modules are MIME-checked strictly, so .mjs must not fall through to
+        // application/octet-stream: the PDF.js bundle would be rejected and the
+        // whole page script graph would fail to load.
+        [".mjs"] = "text/javascript; charset=utf-8",
         [".json"] = "application/json; charset=utf-8", [".webmanifest"] = "application/manifest+json", [".svg"] = "image/svg+xml", [".png"] = "image/png"
     };
     private static readonly IReadOnlyDictionary<string, string> Resources = Assembly.GetExecutingAssembly().GetManifestResourceNames()

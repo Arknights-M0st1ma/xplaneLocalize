@@ -42,8 +42,11 @@ internal static class ConfigStore
         "SimbriefUser", "SimbriefApiUrl",
         "WeatherApiKey",
         "WeatherProxyMode", "WeatherProxyUrl", "WeatherProxyUser", "WeatherProxyPassword",
-        "XplanePath", "GroundMinZoom", "AirlineLogoUrlTemplate",
-        "ProxyMode", "ProxyUrl"
+        "XplanePath", "GroundMinZoom", "AirlineLogoUrlTemplate", "ManualFolder",
+        "ProxyMode", "ProxyUrl",
+        // Which simulator feeds the map (xp = X-Plane 12 over UDP, tsw = Train Sim World 6
+        // over its local HTTP API) plus the TSW endpoint, key path and polling rate.
+        "TelemetrySource", "TswApiUrl", "TswApiKeyPath", "TswPollHz"
     ];
 
     public static readonly string[] ObsoleteKeys =
@@ -208,6 +211,7 @@ internal static class ConfigStore
             ["XplanePath"] = config.XplanePath,
             ["GroundMinZoom"] = config.GroundMinZoom,
             ["AirlineLogoUrlTemplate"] = config.AirlineLogoUrlTemplate,
+            ["ManualFolder"] = config.ManualFolder,
             ["ProxyMode"] = config.ProxyMode,
             ["ProxyUrl"] = config.ProxyUrl
         };

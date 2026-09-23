@@ -196,6 +196,66 @@ function withFallbackPosition(airport, waypoint) {
   return { ...airport, lat: waypoint.lat, lon: waypoint.lon };
 }
 
+// Weights and fuel for the plan page.
+//
+// The names matter: a real json=v2 OFP puts the *planned* weights under
+// est_zfw / est_tow / est_ldw and the aircraft limits under max_zfw / max_tow /
+// max_ldw. Reading zfw/tow/ldw/mtow/mlw (an earlier guess here) returned null for
+// every pilot, which is why the load card showed nothing. The shorter names are
+// still accepted as a fallback for other payload shapes.
+function planWeights(payload) {
+  const weights = payload?.weights ?? {};
+  const fuel = payload?.fuel ?? {};
+  const general = payload?.general ?? {};
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = toNumber(weights[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  return {
+    // Units live on the request parameters ("kgs" / "lbs"), not in the blocks.
+    units: String(payload?.params?.units ?? weights.units ?? fuel.units ?? '').trim().toUpperCase(),
+    weight: {
+      pax: toNumber(weights.pax_count),
+      bags: toNumber(weights.bag_count),
+      cargo: toNumber(weights.cargo),
+      freight: toNumber(weights.freight_added),
+      payload: toNumber(weights.payload),
+      oew: toNumber(weights.oew),
+      zfw: pick('est_zfw', 'zfw'),
+      tow: pick('est_tow', 'tow'),
+      lw: pick('est_ldw', 'ldw'),
+      ramp: pick('est_ramp', 'ramp'),
+      maxZfw: pick('max_zfw', 'mzfw'),
+      maxTow: pick('max_tow', 'mtow'),
+      maxLw: pick('max_ldw', 'mlw'),
+      towLimitCode: String(weights.tow_limit_code ?? '').trim()
+    },
+    fuel: {
+      block: toNumber(fuel.plan_ramp),
+      takeoff: toNumber(fuel.plan_takeoff),
+      landing: toNumber(fuel.plan_landing),
+      taxi: toNumber(fuel.taxi),
+      enroute: toNumber(fuel.enroute_burn),
+      contingency: toNumber(fuel.contingency),
+      alternate: toNumber(fuel.alternate_burn),
+      reserve: toNumber(fuel.reserve),
+      extra: toNumber(fuel.extra),
+      minTakeoff: toNumber(fuel.min_takeoff),
+      avgFlow: toNumber(fuel.avg_fuel_flow)
+    },
+    cruise: {
+      mach: toNumber(general.cruise_mach),
+      tas: toNumber(general.cruise_tas),
+      costIndex: toNumber(general.costindex ?? general.cost_index),
+      airDistanceNm: toNumber(general.air_distance),
+      greatCircleNm: toNumber(general.gc_distance)
+    }
+  };
+}
+
 // Normalises an OFP payload into the small shape the EFB draws. Unknown fields
 // are ignored rather than throwing, so a SimBrief format change degrades to a
 // partial route instead of breaking the map.
@@ -224,6 +284,7 @@ export function parseFlightPlan(payload) {
     cruiseAltitudeFt: toNumber(general.initial_altitude ?? general.cruise_altitude),
     distanceNm: toNumber(general.route_distance ?? general.gc_distance),
     eteSeconds: durationSeconds(payload.times?.est_time_enroute),
+    ...planWeights(payload),
     flight: flightInfo(payload),
     waypoints
   };

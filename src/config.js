@@ -30,6 +30,10 @@ export const config = Object.freeze({
   webHost: process.env.EFB_HOST || '0.0.0.0',
   webPort: port('EFB_PORT', 8080),
   demo: process.argv.includes('--demo') || process.env.EFB_DEMO === '1',
+  // Demo telemetry shape: "plane" (default) or "tsw" for Train Sim World frames. The dev server
+  // never talks to the real game API - that lives in the Windows exe - so this is how the train
+  // front end is developed without the game installed.
+  demoSource: (process.env.EFB_DEMO_SOURCE || 'plane').trim().toLowerCase() === 'tsw' ? 'tsw' : 'xp',
   tlsCert: process.env.EFB_TLS_CERT || '',
   tlsKey: process.env.EFB_TLS_KEY || '',
   customBaseMapName: process.env.CUSTOM_BASE_MAP_NAME || '',
@@ -40,5 +44,8 @@ export const config = Object.freeze({
   simbriefEndpoint: process.env.SIMBRIEF_API_URL || '',
   // OpenWeatherMap API key for the optional weather overlays (exe keeps this in
   // its own config file; the dev server reads it from the environment).
-  weatherApiKey: process.env.OWM_API_KEY || ''
+  weatherApiKey: process.env.OWM_API_KEY || '',
+  // Folder of PDF manuals served to the EFB reader (the iPad cannot read the
+  // PC's disk itself).
+  manualFolder: process.env.EFB_MANUAL_FOLDER || ''
 });

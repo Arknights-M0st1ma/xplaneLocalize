@@ -27,6 +27,7 @@ internal sealed class SettingsForm : Form
     private Label groundHint = new();
     private NumericUpDown groundMinZoom = new();
     private TextBox airlineLogoUrl = new();
+    private TextBox manualFolder = new();
     private TextBox simbriefUser = new();
     private CheckBox showSimbrief = new();
     private Button testRoute = new();
@@ -45,6 +46,13 @@ internal sealed class SettingsForm : Form
     private TextBox weatherProxyPassword = new();
     private CheckBox showWeatherProxy = new();
     private Label weatherProxyNote = new();
+    private ComboBox telemetrySource = new();
+    private TextBox tswApiUrl = new();
+    private TextBox tswKeyPath = new();
+    private NumericUpDown tswPollHz = new();
+    private Button testTsw = new();
+    private Label testTswResult = new();
+    private Label tswNote = new();
     private TextBox diagnostics = new();
     private Label status = new();
     private Label banner = new();
@@ -107,6 +115,7 @@ internal sealed class SettingsForm : Form
 
         tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(S(14), S(6)) };
         tabs.TabPages.Add(BuildConnectionTab());
+        tabs.TabPages.Add(BuildSourceTab());
         tabs.TabPages.Add(BuildMapTab());
         tabs.TabPages.Add(BuildRouteTab());
         tabs.TabPages.Add(BuildWeatherTab());
@@ -235,6 +244,196 @@ internal sealed class SettingsForm : Form
         return tab;
     }
 
+    private TabPage BuildSourceTab()
+    {
+        var page = Page(out var stack);
+        var tab = new TabPage("数据源") { BackColor = Color.White, Padding = new Padding(6) };
+        tab.Controls.Add(page);
+
+        telemetrySource = new ComboBox { Width = S(420), DropDownStyle = ComboBoxStyle.DropDownList };
+        telemetrySource.Items.AddRange([
+            "X-Plane 12（UDP DATA 包，默认）",
+            "Train Sim World 6（本机 HTTP API）"
+        ]);
+        telemetrySource.SelectedIndexChanged += (_, _) => SyncSourceEnabled();
+        AddField(stack, "地图跟随哪个模拟器", telemetrySource,
+            "两者互斥：它们都会写同一份位置/协议字段，同时收会让地图上的图标来回跳。切换后需要重启服务（保存时会询问）。",
+            ErrorSlot(telemetrySource));
+
+        stack.Controls.Add(Caption("Train Sim World 6"));
+        stack.Controls.Add(Hint(
+            "TSW6 内置一个官方 HTTP API（默认 http://127.0.0.1:31270），只能在装了游戏的这台电脑上访问，"
+            + "因此桥接器必须和游戏同机运行。启用方式：Steam → TSW6 → 属性 → 启动选项加入 -HTTPAPI，"
+            + "启动一次游戏后它会生成密钥文件。主机（PS/Xbox）版没有这个 API。"));
+
+        tswApiUrl = new TextBox { Width = S(360) };
+        AddField(stack, "API 地址（可留空）", tswApiUrl,
+            "留空即使用游戏默认的 http://127.0.0.1:31270。只有在自己做了端口转发或指向测试用假服务器时才需要填写。",
+            ErrorSlot(tswApiUrl));
+
+        tswKeyPath = new TextBox { Width = S(420) };
+        var browseKey = new Button { Text = "选择文件…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(100), S(28)) };
+        browseKey.Click += (_, _) => BrowseKeyFile();
+        var keyRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+        keyRow.Controls.Add(tswKeyPath);
+        keyRow.Controls.Add(browseKey);
+        AddField(stack, "密钥文件（可留空）", keyRow,
+            "留空时自动在“文档\\My Games\\TrainSimWorld6\\Saved\\Config\\CommAPIKey.txt”等默认位置查找（含 OneDrive 重定向的文档目录）。"
+            + "密钥只读进内存、不写入配置文件、不下发给 iPad、不写日志。",
+            ErrorSlot(tswKeyPath));
+
+        tswPollHz = new NumericUpDown { Minimum = 1, Maximum = 10, Width = S(90), TextAlign = HorizontalAlignment.Right };
+        AddField(stack, "轮询频率（Hz）", tswPollHz,
+            "游戏 API 只有请求/响应、没有推送，所以由桥接器轮询。默认 4 Hz 已经足够地图流畅；"
+            + "每帧都会变成一条发给每个 iPad 的 WebSocket 消息，所以不建议调到 10 Hz。",
+            ErrorSlot(tswPollHz));
+
+        testTsw = new Button { Text = "测试连接", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(120), S(32)) };
+        testTsw.Click += async (_, _) => await TestTswAsync();
+        testTswResult = new Label { AutoSize = true, MaximumSize = new Size(S(540), 0), ForeColor = Color.FromArgb(60, 60, 60), Margin = new Padding(0, S(6), 0, 0) };
+        stack.Controls.Add(Caption("验证"));
+        stack.Controls.Add(testTsw);
+        stack.Controls.Add(testTswResult);
+        stack.Controls.Add(Hint("测试会连接上面的地址、检查密钥是否被接受，并列出游戏实际暴露的端点。不需要先保存，也不需要游戏正在飞行。"));
+
+        tswNote = new Label { AutoSize = true, MaximumSize = new Size(S(540), 0), ForeColor = Color.FromArgb(105, 105, 105), Margin = new Padding(0, S(8), 0, 0) };
+        stack.Controls.Add(tswNote);
+        return tab;
+    }
+
+    // Reads the game-generated key file path. Uses the built-in picker (the Windows one loads every
+    // installed shell extension and can take the process down with it - see README).
+    private void BrowseKeyFile()
+    {
+        try
+        {
+            var typed = tswKeyPath.Text.Trim();
+            var initial = File.Exists(typed)
+                ? Path.GetDirectoryName(typed)!
+                : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "My Games", "TrainSimWorld6", "Saved", "Config");
+            if (!Directory.Exists(initial)) initial = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            using var picker = new FolderPicker(
+                "选择 TSW6 生成的 CommAPIKey.txt",
+                "通常是“文档\\My Games\\TrainSimWorld6\\Saved\\Config\\CommAPIKey.txt”。也可以直接把路径粘贴到输入框。",
+                initial,
+                DescribeKeyFile);
+            if (picker.ShowDialog(this) == DialogResult.OK && picker.SelectedPath.Length > 0)
+            {
+                tswKeyPath.Text = picker.SelectedPath;
+                testTswResult.Text = "";
+            }
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, $"无法打开选择器：{error.Message}\n\n请直接把路径粘贴到输入框。", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    // Never reports the key itself, only whether a usable file is there.
+    private static (string Text, bool Ok) DescribeKeyFile(string path)
+    {
+        if (File.Exists(path))
+        {
+            try
+            {
+                var key = File.ReadAllText(path).Trim().TrimStart('\uFEFF').Trim();
+                return key.Length == 0
+                    ? ("这个文件是空的，游戏可能还没写完密钥。", false)
+                    : ($"读取到 {key.Length} 个字符的密钥（内容不会显示，也不会写进配置）。", true);
+            }
+            catch (Exception error)
+            {
+                return ($"无法读取：{error.Message}", false);
+            }
+        }
+        if (Directory.Exists(path)) return ("这是文件夹。请进入 Config 目录后选中 CommAPIKey.txt；留空则自动查找。", false);
+        return ("这里没有文件。", false);
+    }
+
+    private async Task TestTswAsync()
+    {
+        var address = tswApiUrl.Text.Trim();
+        if (address.Length > 0 && (!Uri.TryCreate(address, UriKind.Absolute, out var parsed) || parsed.Scheme is not ("http" or "https")))
+        {
+            testTswResult.Text = "API 地址格式不对：应留空或填 http://主机:端口。";
+            return;
+        }
+        var typedKey = tswKeyPath.Text.Trim();
+        if (typedKey.Length > 0 && !File.Exists(typedKey))
+        {
+            testTswResult.Text = $"找不到这个密钥文件：{typedKey}";
+            return;
+        }
+
+        testTsw.Enabled = false;
+        testTswResult.Text = "测试中…";
+        try
+        {
+            using var client = new TswApiClient(typedKey, address);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+            var probe = await client.ProbeAsync(timeout.Token);
+            var lines = new List<string> { probe.Summary };
+            lines.Add($"地址：{probe.BaseUrl}");
+            if (probe.KeyConfigured && probe.KeyPath.Length > 0) lines.Add($"密钥：{probe.KeyPath}");
+            else if (!probe.KeyConfigured) lines.Add($"密钥：{probe.KeyNote}");
+            if (probe.TcpReachable && probe.ListOk)
+            {
+                lines.Add($"根节点：{(probe.Nodes.Count > 0 ? string.Join("、", probe.Nodes.Take(12)) : "（未列出）")}");
+                lines.Add(probe.InfoAvailable
+                    ? $"游戏：{probe.GameName} · Worker {probe.Worker} · build {probe.GameBuild} · API {probe.ApiVersion}"
+                    : "注意：/info 不可用（该路由不在公开规范里），但 /list 正常，所以 API 是可用的。");
+                var position = await PositionProbeAsync(client, timeout.Token);
+                lines.Add(position);
+            }
+            testTswResult.Text = string.Join(Environment.NewLine, lines);
+        }
+        catch (OperationCanceledException)
+        {
+            testTswResult.Text = "测试超时（12 秒）。确认游戏在运行、且启动项里有 -HTTPAPI。";
+        }
+        catch (Exception error)
+        {
+            testTswResult.Text = "测试失败：" + error.Message;
+        }
+        finally
+        {
+            testTsw.Enabled = true;
+        }
+    }
+
+    // Reports whether a position endpoint is actually readable; this is the check that turns
+    // "the API answers" into "the map can be drawn". Field names come from third-party docs, so the
+    // candidates are tried in the same order as TswTelemetrySource uses.
+    private static async Task<string> PositionProbeAsync(TswApiClient client, CancellationToken token)
+    {
+        var candidates = new (string Node, string Endpoint)[]
+        {
+            ("DriverAid", "PlayerInfo"),
+            ("DriverAid", "Data"),
+            ("CurrentDrivableActor", "LatLon")
+        };
+        foreach (var (node, endpoint) in candidates)
+        {
+            var response = await client.GetAsync(node, endpoint, token);
+            if (!response.Ok) continue;
+            var latitude = TswMapper.FindDeep(response.Values, ["latitude", "lat", "Latitude"]);
+            var longitude = TswMapper.FindDeep(response.Values, ["longitude", "lon", "Longitude"]);
+            if (latitude is double lat && longitude is double lon)
+                return $"位置端点可用：{node}.{endpoint} → {lat:0.00000}, {lon:0.00000}";
+        }
+        return "没能读到位置：已试 DriverAid.PlayerInfo / DriverAid.Data / CurrentDrivableActor.LatLon。"
+            + "如果游戏在主菜单，请进入一条线路后再测；也可以点“测试连接”后把结果发给开发者核对端点名。";
+    }
+
+    private void SyncSourceEnabled()
+    {
+        var tsw = telemetrySource.SelectedIndex == 1;
+        tswApiUrl.Enabled = tsw;
+        tswKeyPath.Enabled = tsw;
+        tswPollHz.Enabled = tsw;
+        testTsw.Enabled = tsw;
+    }
+
     private TabPage BuildMapTab()
     {
         var page = Page(out var stack);
@@ -285,6 +484,16 @@ internal sealed class SettingsForm : Form
         airlineLogoUrl = new TextBox { Width = S(470) };
         AddField(stack, "航司 logo 地址模板（可选）", airlineLogoUrl,
             "留空时只在航班卡片上显示三字码徽章。航司 logo 属于商标素材，如果你有自己的授权来源，可填写例如 https://example.com/airlines/{icao}_200.png —— {icao} 会替换成三字码；请自行确认该来源的使用许可。", ErrorSlot(airlineLogoUrl));
+
+        // ------------------------------------------------------------ manuals
+        manualFolder = new TextBox { Width = S(360) };
+        var manualBrowse = new Button { Text = "选择文件夹…", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(110), S(30)), Margin = new Padding(S(8), 0, 0, 0) };
+        manualBrowse.Click += (_, _) => BrowseForManuals();
+        var manualRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+        manualRow.Controls.Add(manualFolder);
+        manualRow.Controls.Add(manualBrowse);
+        AddField(stack, "手册文件夹（PDF）", manualRow,
+            "把这个文件夹里的 PDF（机务手册、QRH、检查单…）提供给 iPad 的“手册”页阅读，子文件夹也会一并列出。PDF 只在本机读取，不会上传；留空则手册页显示未配置。", ErrorSlot(manualFolder));
         return tab;
     }
 
@@ -461,6 +670,7 @@ internal sealed class SettingsForm : Form
         xplanePath.Text = config.XplanePath;
         groundMinZoom.Value = Math.Clamp(config.GroundMinZoom, 10, 19);
         airlineLogoUrl.Text = config.AirlineLogoUrlTemplate;
+        manualFolder.Text = config.ManualFolder;
         simbriefUser.Text = config.SimbriefUser;
         weatherKey.Text = config.WeatherApiKey;
         weatherProxyMode.SelectedIndex = config.WeatherProxyMode switch
@@ -485,12 +695,41 @@ internal sealed class SettingsForm : Form
             _ => 0
         };
         proxyUrl.Text = config.ProxyUrl;
+        telemetrySource.SelectedIndex = config.UsesTsw ? 1 : 0;
+        tswApiUrl.Text = config.TswApiUrl;
+        tswKeyPath.Text = config.TswApiKeyPath;
+        tswPollHz.Value = Math.Clamp(config.TswPollHz, 1, 10);
         try { autoStart.Checked = AutoStart.IsEnabled(); } catch { autoStart.Enabled = false; }
         loading = false;
         SyncBaseMapEnabled();
         SyncProxyEnabled();
         SyncWeatherProxyEnabled();
+        SyncSourceEnabled();
+        UpdateTswNote();
         UpdateDiagnostics();
+    }
+
+    // Explains, before the user saves, what the TSW source needs on this machine. Only file
+    // existence is reported; the key itself is never read into the UI.
+    private void UpdateTswNote()
+    {
+        if (telemetrySource.SelectedIndex != 1)
+        {
+            tswNote.Text = "当前使用 X-Plane 12 数据源：UDP 端口与“连接”页里的设置生效。";
+            return;
+        }
+        var typed = tswKeyPath.Text.Trim();
+        if (typed.Length > 0)
+        {
+            tswNote.Text = File.Exists(typed)
+                ? "已指定密钥文件。切换后记得保存并重启服务。"
+                : $"指定的密钥文件不存在：{typed}";
+            return;
+        }
+        var found = TswApiClient.KeyCandidates(null).FirstOrDefault(File.Exists);
+        tswNote.Text = found is not null
+            ? $"已自动找到密钥文件：{found}"
+            : "还没找到密钥文件。请确认 TSW6 的 Steam 启动项已加入 -HTTPAPI 并至少启动过一次游戏；也可以手动指定路径。";
     }
 
     private void SyncBaseMapEnabled()
@@ -525,6 +764,7 @@ internal sealed class SettingsForm : Form
         {
             $"配置文件：{snapshot.Path}",
             $"最近备份：{(backups.Count > 0 ? backups[0].Name : "（暂无）")}",
+            $"数据源：{(config.UsesTsw ? "Train Sim World 6（本机 HTTP API）" : "X-Plane 12（UDP DATA）")}",
             $"保存后网页端口：{config.WebPort}",
             $"保存后 UDP 端口：{string.Join(", ", config.UdpPorts)}",
             $"iPad 访问地址（当前）：{lanUrl}",
@@ -539,6 +779,14 @@ internal sealed class SettingsForm : Form
             $"航司 logo：{(config.AirlineLogoUrlTemplate.Length > 0 ? "使用自定义模板" : "仅三字码徽章（默认）")}",
             $"代理：{(config.ProxyMode switch { BridgeConfig.ProxySystem => "系统代理", BridgeConfig.ProxyManual => "手动 " + config.ProxyUrl, _ => "不使用" })}"
         };
+        if (config.UsesTsw)
+        {
+            lines.Add($"TSW API：{(config.TswApiUrl.Length > 0 ? config.TswApiUrl : $"http://127.0.0.1:{TswApiClient.DefaultPort}（默认）")} · {config.TswPollHz} Hz");
+            var typedKey = config.TswApiKeyPath;
+            var foundKey = typedKey.Length > 0 ? "" : TswApiClient.KeyCandidates(null).FirstOrDefault(File.Exists) ?? "";
+            var keyFile = typedKey.Length > 0 ? (File.Exists(typedKey) ? typedKey : typedKey + "（文件不存在）") : foundKey;
+            lines.Add($"TSW 密钥：{(keyFile.Length > 0 ? keyFile : "未找到（需要 -HTTPAPI 启动一次游戏）")}");
+        }
         diagnostics.Text = string.Join(Environment.NewLine, lines);
     }
 
@@ -561,6 +809,7 @@ internal sealed class SettingsForm : Form
         config.XplanePath = typedPath.Length > 0 ? AptDat.ResolveRoot(typedPath) : "";
         config.GroundMinZoom = (int)Math.Clamp(groundMinZoom.Value, 10, 19);
         config.AirlineLogoUrlTemplate = airlineLogoUrl.Text.Trim();
+        config.ManualFolder = manualFolder.Text.Trim();
         config.SimbriefUser = simbriefUser.Text.Trim();
         config.SimbriefApiUrl = original.SimbriefApiUrl;
         config.WeatherApiKey = weatherKey.Text.Trim();
@@ -581,6 +830,10 @@ internal sealed class SettingsForm : Form
             _ => BridgeConfig.ProxyNone
         };
         config.ProxyUrl = proxyUrl.Text.Trim();
+        config.TelemetrySource = telemetrySource.SelectedIndex == 1 ? BridgeConfig.SourceTsw : BridgeConfig.SourceXPlane;
+        config.TswApiUrl = tswApiUrl.Text.Trim().TrimEnd('/');
+        config.TswApiKeyPath = tswKeyPath.Text.Trim();
+        config.TswPollHz = (int)Math.Clamp(tswPollHz.Value, 1, 10);
         return config;
     }
 
@@ -680,7 +933,7 @@ internal sealed class SettingsForm : Form
 
     private void RestoreDefaults()
     {
-        if (MessageBox.Show(this, "把界面上的所有设置恢复为默认值（还没有保存）。\n\n默认：网页端口 8080、UDP 端口 49000、不使用代理、无 SimBrief、无自定义底图。",
+        if (MessageBox.Show(this, "把界面上的所有设置恢复为默认值（还没有保存）。\n\n默认：数据源 X-Plane 12、网页端口 8080、UDP 端口 49000、不使用代理、无 SimBrief、无自定义底图。",
                 Text, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
         LoadValues(new BridgeConfig());
         foreach (var label in errors.Values) { label.Visible = false; label.Text = ""; }
@@ -715,7 +968,17 @@ internal sealed class SettingsForm : Form
         a.WebPort == b.WebPort && a.UdpPorts.SequenceEqual(b.UdpPorts) && a.SourceIp == b.SourceIp &&
         a.CustomBaseMapName == b.CustomBaseMapName && a.CustomBaseMapUrl == b.CustomBaseMapUrl &&
         a.CustomBaseMapAttribution == b.CustomBaseMapAttribution && a.SimbriefUser == b.SimbriefUser &&
-        a.ProxyMode == b.ProxyMode && a.ProxyUrl == b.ProxyUrl;
+        a.ProxyMode == b.ProxyMode && a.ProxyUrl == b.ProxyUrl &&
+        // These were missing before, so a window closed with only one of them changed used to look
+        // "unchanged" and the edit was silently dropped.
+        a.XplanePath == b.XplanePath && a.GroundMinZoom == b.GroundMinZoom &&
+        a.AirlineLogoUrlTemplate == b.AirlineLogoUrlTemplate &&
+        a.ManualFolder == b.ManualFolder &&
+        a.WeatherApiKey == b.WeatherApiKey && a.WeatherProxyMode == b.WeatherProxyMode &&
+        a.WeatherProxyUrl == b.WeatherProxyUrl && a.WeatherProxyUser == b.WeatherProxyUser &&
+        a.WeatherProxyPassword == b.WeatherProxyPassword &&
+        a.TelemetrySource == b.TelemetrySource && a.TswApiUrl == b.TswApiUrl &&
+        a.TswApiKeyPath == b.TswApiKeyPath && a.TswPollHz == b.TswPollHz;
 
     // ------------------------------------------------------------------ validation
     private bool ValidateAll(out Control? firstBad)
@@ -804,6 +1067,21 @@ internal sealed class SettingsForm : Form
             else if (url.Contains('@')) Fail(proxyUrl, "代理地址里不要带用户名:密码（会明文保存）。需要认证请改用“系统代理”。");
             else if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.Port <= 0)
                 Fail(proxyUrl, "代理地址格式应为 http://主机:端口，例如 http://127.0.0.1:7890。");
+        }
+
+        if (telemetrySource.SelectedIndex == 1)
+        {
+            var api = tswApiUrl.Text.Trim();
+            if (api.Length > 0)
+            {
+                if (!Uri.TryCreate(api, UriKind.Absolute, out var apiUri) || apiUri.Scheme is not ("http" or "https"))
+                    Fail(tswApiUrl, "API 地址应留空，或填 http://主机:端口 形式的完整地址。");
+                else if (BridgeConfig.ContainsSecret(api))
+                    Fail(tswApiUrl, "地址里带有疑似密钥参数。默认地址不需要密钥，请留空。");
+            }
+            var key = tswKeyPath.Text.Trim();
+            if (key.Length > 0 && !File.Exists(key))
+                Fail(tswKeyPath, "这个文件不存在。留空则由程序自动查找默认位置。");
         }
 
         firstBad = first;
@@ -980,6 +1258,52 @@ internal sealed class SettingsForm : Form
             return;
         }
         testWeatherKey.Text = $"测试连接（{weatherCooldownSeconds}s）";
+    }
+
+    // ------------------------------------------------------------- 手册文件夹
+    private void BrowseForManuals()
+    {
+        try
+        {
+            var initial = manualFolder.Text.Trim();
+            if (initial.Length == 0 || !Directory.Exists(initial))
+                initial = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            using var picker = new FolderPicker(
+                "选择手册文件夹",
+                "选中存放 PDF 手册的文件夹（子文件夹也会一并列出）。也可以直接把路径粘贴到下面的输入框。",
+                initial,
+                DescribeManualFolder);
+            if (picker.ShowDialog(this) == DialogResult.OK && picker.SelectedPath.Length > 0)
+                manualFolder.Text = picker.SelectedPath;
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this,
+                $"打开文件夹选择窗口时出错：{SecretProtection.Redact(error.Message)}\n\n可以把路径直接粘贴到“手册文件夹”输入框里，效果一样。",
+                "X-Plane EFB Bridge", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    internal static (string Text, bool Ok) DescribeManualFolder(string path)
+    {
+        try
+        {
+            if (!Directory.Exists(path)) return ("文件夹不存在", false);
+            var count = 0;
+            foreach (var _ in Directory.EnumerateFiles(path, "*.pdf", SearchOption.AllDirectories))
+            {
+                count += 1;
+                if (count > Manuals.MaxManuals) break;
+            }
+            if (count == 0) return ("这个文件夹里没有找到 PDF", false);
+            return (count > Manuals.MaxManuals
+                ? $"找到 600 个以上 PDF（只列出前 {Manuals.MaxManuals} 个）"
+                : $"找到 {count} 个 PDF", true);
+        }
+        catch (Exception error)
+        {
+            return ($"无法读取：{SecretProtection.Redact(error.Message)}", false);
+        }
     }
 
     // ------------------------------------------------------------ X-Plane 目录

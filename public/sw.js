@@ -1,8 +1,9 @@
 // Application shell cache. Only registered on a secure context (HTTPS or
 // localhost), so a plain http://iPad-IP connection keeps working without it.
-const CACHE = 'xp-efb-shell-v25';
+const CACHE = 'xp-efb-shell-v28';
 const SHELL = [
-  '/', '/styles.css?v=25', '/app.js?v=25', '/track-retention.js', '/manifest.webmanifest', '/assets/icon.svg', '/data/airlines.json',
+  '/', '/styles.css?v=28', '/app.js?v=28', '/pages.js', '/manual.js', '/track-retention.js', '/protocol.js', '/geo.js', '/manifest.webmanifest', '/assets/icon.svg', '/data/airlines.json',
+  '/vendor/pdfjs/pdf.min.mjs', '/vendor/pdfjs/pdf.worker.min.mjs',
   '/vendor/leaflet/leaflet.css', '/vendor/leaflet/leaflet.js',
   '/vendor/leaflet/images/marker-icon.png', '/vendor/leaflet/images/marker-shadow.png'
 ];
