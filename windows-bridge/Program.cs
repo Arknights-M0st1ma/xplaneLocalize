@@ -445,7 +445,7 @@ internal sealed class TrayContext : ApplicationContext
 
     private void UpdateStatusHint()
     {
-        if (pendingRestart) statusItem.Text = "配置已保存 · 端口改动待重启服务生效";
+        if (pendingRestart) statusItem.Text = "配置已保存 · 端口或数据源改动待重启服务生效（托盘菜单 → 重新加载配置）";
     }
 
     private void StartService()

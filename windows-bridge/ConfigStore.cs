@@ -213,7 +213,15 @@ internal static class ConfigStore
             ["AirlineLogoUrlTemplate"] = config.AirlineLogoUrlTemplate,
             ["ManualFolder"] = config.ManualFolder,
             ["ProxyMode"] = config.ProxyMode,
-            ["ProxyUrl"] = config.ProxyUrl
+            ["ProxyUrl"] = config.ProxyUrl,
+            // These four are read per use, but they still have to be written here: the loop below
+            // keeps every key the program does NOT know about and skips the ones it does, so a key
+            // that is listed in KnownKeys but missing from this object would be dropped on every
+            // save. That is exactly how "地图跟随 Train Sim World 6" came back as "X-Plane 12".
+            ["TelemetrySource"] = config.TelemetrySource,
+            ["TswApiUrl"] = config.TswApiUrl,
+            ["TswApiKeyPath"] = config.TswApiKeyPath,
+            ["TswPollHz"] = config.TswPollHz
         };
         if (existing is null) return root;
 

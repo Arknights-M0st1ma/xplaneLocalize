@@ -101,6 +101,30 @@ internal static class ConfigSelfTest
         var text2 = File.ReadAllText(path);
         Check("显式清理废弃键", !text2.Contains("NavigraphExternalUrl") && text2.Contains("MyOwnKey"));
 
+        // 2b. Every key the program knows about has to survive a save. The credentials-free way to
+        //     get this wrong is to add a key to KnownKeys without writing it in BuildRoot: such a key
+        //     is skipped by the "keep the user's own keys" loop and silently dropped. That is how
+        //     "地图跟随 Train Sim World 6" came back as "X-Plane 12" in the settings window.
+        var keysPath = Path.Combine(directory, "known-keys.json");
+        var keysSnapshot = ConfigStore.Load(keysPath);
+        ConfigStore.Save(keysSnapshot, keysSnapshot.Config, cleanObsolete: false, keysSnapshot.WriteTimeUtc, keysSnapshot.Length);
+        var keysText = File.ReadAllText(keysPath);
+        var keysMissing = ConfigStore.KnownKeys.Where(key => !keysText.Contains($"\"{key}\"", StringComparison.Ordinal)).ToList();
+        Check("每个已知键都会写进文件", keysMissing.Count == 0,
+            keysMissing.Count == 0 ? $"{ConfigStore.KnownKeys.Length} 个" : "缺少 " + string.Join("、", keysMissing));
+
+        var roundTripSnapshot = ConfigStore.Load(keysPath);
+        var switchedConfig = roundTripSnapshot.Config.Clone();
+        switchedConfig.TelemetrySource = BridgeConfig.SourceTsw;
+        switchedConfig.TswPollHz = 7;
+        switchedConfig.TswApiKeyPath = Path.Combine(directory, "CommAPIKey.txt");
+        ConfigStore.Save(roundTripSnapshot, switchedConfig, cleanObsolete: false, roundTripSnapshot.WriteTimeUtc, roundTripSnapshot.Length);
+        var reloadedConfig = ConfigStore.Load(keysPath).Config;
+        Check("TSW 数据源保存后能读回",
+            reloadedConfig.UsesTsw && reloadedConfig.TswPollHz == 7
+            && reloadedConfig.TswApiKeyPath.EndsWith("CommAPIKey.txt", StringComparison.Ordinal),
+            $"{reloadedConfig.TelemetrySource} · {reloadedConfig.TswPollHz} Hz");
+
         // 3. The corrupted "two objects glued together" file this user has seen.
         File.WriteAllText(path, "{ \"UdpPorts\": [49000], \"WebPort\": 8080 } { \"UdpPorts\": [49005], \"WebPort\": 9090 }");
         var snapshot3 = ConfigStore.Load(path);

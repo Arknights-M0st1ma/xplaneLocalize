@@ -875,6 +875,13 @@ internal sealed class SettingsForm : Form
         }
 
         var portsChanged = edited.WebPort != original.WebPort || !edited.UdpPorts.SequenceEqual(original.UdpPorts);
+        // The collector is chosen once when the service starts (RunAsync either listens on UDP or
+        // polls the TSW API), so a new data source - or a moved TSW endpoint/key - only takes effect
+        // after a restart. Without this the window saved the new source, the tray said "saved",
+        // and the iPad kept showing the old simulator until the user found the tray menu item.
+        var sourceChanged = edited.TelemetrySource != original.TelemetrySource
+            || !string.Equals(edited.TswApiUrl, original.TswApiUrl, StringComparison.Ordinal)
+            || !string.Equals(edited.TswApiKeyPath, original.TswApiKeyPath, StringComparison.Ordinal);
         var retry = true;
         while (retry)
         {
@@ -920,10 +927,12 @@ internal sealed class SettingsForm : Form
                 "设置内容与配置文件一致，没有重复写入，也没有新增备份。\n\n（开机自动启动这类不在配置文件里的选项已经立即生效。）",
                 Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
-        if (portsChanged)
+        if (portsChanged || sourceChanged)
         {
+            var reason = portsChanged && sourceChanged ? "端口和数据源改动"
+                : portsChanged ? "端口改动" : "数据源改动";
             var restart = MessageBox.Show(this,
-                "配置已保存。\n\n端口改动需要重启服务才能生效（网页端口 / UDP 端口）。\n现在重启吗？重启过程中 iPad 会短暂断开，之后自动重连。",
+                $"配置已保存。\n\n{reason}需要重启服务才能生效（网页端口 / UDP 端口 / 地图跟随的模拟器）。\n现在重启吗？重启过程中 iPad 会短暂断开，之后自动重连。",
                 Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             RestartRequested = restart == DialogResult.Yes;
         }

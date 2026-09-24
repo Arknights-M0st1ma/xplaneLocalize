@@ -106,7 +106,7 @@ XPlaneEfbBridge.exe
 │  ├─ SIMBRIEF.md                  SimBrief API 调研与接入说明
 │  ├─ GROUND-DATA.md               机场地面数据源评估
 │  ├─ TSW6-TELEMETRY.md            TSW6 调研、评审与集成方案
-│  └─ RELEASE-v0.1*.md / v0.2.0.md 各版本更新说明
+│  └─ RELEASE-v0.1*.md … v0.4.1.md 各版本更新说明
 ├─ .env.example                    Node 调试模式配置
 ├─ .env.tsw-demo                   npm run demo:tsw 用的列车演示配置（无凭据）
 └─ package.json
@@ -528,8 +528,8 @@ npm test
 ```powershell
 npm test                    # 55 项，含假 TSW API、协议判定、列车演示
 npm run demo:tsw            # 浏览器打开 http://127.0.0.1:8081 即可看到列车模式
-XPlaneEfbBridge.exe --config-selftest <临时空目录>   # 120 项配置与 TSW 逻辑自检
-# 加上假 API 可再跑 11 项真实 HTTP 端到端检查（共 131 项）：
+XPlaneEfbBridge.exe --config-selftest <临时空目录>   # 146 项配置与 TSW 逻辑自检
+# 加上假 API 可再跑 11 项真实 HTTP 端到端检查（共 157 项）：
 #   node test/tsw-fake-api.js  然后 $env:EFB_TSW_FAKE_BASE = 'http://127.0.0.1:31270'
 ```
 
@@ -576,6 +576,8 @@ XPlaneEfbBridge.exe --config-selftest <临时空目录>   # 120 项配置与 TSW
 **保存时提示“配置文件在设置窗口打开期间被其它程序修改过”**：你（或其它工具）在窗口打开时改过这个 JSON。选择“是”会用界面上的设置覆盖（覆盖前仍然会备份），选择“否”会放弃本次修改并重新载入磁盘内容。
 
 ### 列车模式相关
+
+**在设置里选了 Train Sim World 6，保存后再打开又变回 X-Plane 12（iPad 一直停在“数据超时”）**：v0.4.0 及更早版本的缺陷，v0.4.1 已修复。原因是保存设置时会把 `TelemetrySource`、`TswApiUrl`、`TswApiKeyPath`、`TswPollHz` 这四个键从配置文件里删掉，加上切换数据源不会提示重启，服务就一直按 X-Plane 的 UDP 在跑。**升级到 v0.4.1 后请重新选一次“Train Sim World 6”并保存**——旧配置里的这四个键已经丢了，需要写回一次；保存时选“现在重启”。
 
 **“测试连接”说连不上 127.0.0.1:31270**：游戏没在运行，或者启动项里没有 `-HTTPAPI`。这个 API 只在游戏运行时存在，且必须在**运行 exe 的同一台电脑**上（已知只监听回环地址）。
 
