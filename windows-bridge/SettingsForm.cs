@@ -403,26 +403,42 @@ internal sealed class SettingsForm : Form
 
     // Reports whether a position endpoint is actually readable; this is the check that turns
     // "the API answers" into "the map can be drawn". Field names come from third-party docs, so the
-    // candidates are tried in the same order as TswTelemetrySource uses.
+    // candidates are tried in the same order as TswTelemetrySource uses, and a failure lists what the
+    // game actually answered — that list is what tells us a field was renamed, instead of guessing.
     private static async Task<string> PositionProbeAsync(TswApiClient client, CancellationToken token)
     {
-        var candidates = new (string Node, string Endpoint)[]
-        {
-            ("DriverAid", "PlayerInfo"),
-            ("DriverAid", "Data"),
-            ("CurrentDrivableActor", "LatLon")
-        };
-        foreach (var (node, endpoint) in candidates)
+        var seen = new List<string>();
+        foreach (var (node, endpoint) in TswTelemetrySource.PositionCandidates)
         {
             var response = await client.GetAsync(node, endpoint, token);
-            if (!response.Ok) continue;
-            var latitude = TswMapper.FindDeep(response.Values, ["latitude", "lat", "Latitude"]);
-            var longitude = TswMapper.FindDeep(response.Values, ["longitude", "lon", "Longitude"]);
-            if (latitude is double lat && longitude is double lon)
+            if (!response.Ok)
+            {
+                seen.Add($"{node}.{endpoint} → HTTP {response.Status}");
+                continue;
+            }
+            if (TswMapper.Coordinates(response.Values) is (double lat, double lon))
                 return $"位置端点可用：{node}.{endpoint} → {lat:0.00000}, {lon:0.00000}";
+            seen.Add($"{node}.{endpoint} → HTTP 200，字段：{TswMapper.DescribeFields(response.Values)}");
         }
-        return "没能读到位置：已试 DriverAid.PlayerInfo / DriverAid.Data / CurrentDrivableActor.LatLon。"
-            + "如果游戏在主菜单，请进入一条线路后再测；也可以点“测试连接”后把结果发给开发者核对端点名。";
+
+        // The same fallback the bridge uses at runtime: both public TSW6 clients read the player
+        // position from /subscription rather than from /get.
+        var subscriptionId = Random.Shared.Next(1, ushort.MaxValue);
+        foreach (var (node, endpoint) in TswTelemetrySource.PositionCandidates)
+        {
+            var registered = await client.SubscribeAsync(node, endpoint, subscriptionId, token);
+            if (!registered.Ok) continue;
+            var read = await client.ReadSubscriptionAsync(subscriptionId, token);
+            if (!read.Ok) continue;
+            var values = TswMapper.SubscriptionValues(read.Root ?? read.Values);
+            if (values is null) continue;
+            if (TswMapper.Coordinates(values) is (double subLat, double subLon))
+                return $"位置端点可用：{node}.{endpoint}（订阅）→ {subLat:0.00000}, {subLon:0.00000}";
+        }
+
+        return "没能读到位置。"
+            + (seen.Count > 0 ? "游戏返回：" + string.Join("；", seen) + "。" : "")
+            + "游戏在主菜单或加载中时没有坐标，进入一条线路后再测；若仍然没有，请把这段文字（不含密钥）发给开发者核对端点与字段名。";
     }
 
     private void SyncSourceEnabled()

@@ -126,8 +126,9 @@ test('lists nodes and endpoints, including a node path that contains a slash', a
 });
 
 test('answers 400 for an unknown subscription id and for an unknown endpoint', async (context) => {
-  // Why: the MVP polls /get instead of subscribing, so the client must be able to
-  // tell a subscription error from a route error while that decision is revisited.
+  // Why: the bridge falls back to /subscription when no /get candidate carries a
+  // position, so "this id was never registered" has to stay distinguishable from
+  // "this endpoint does not exist".
   const fake = await createFakeTswApi();
   context.after(() => fake.stop());
 
@@ -139,6 +140,57 @@ test('answers 400 for an unknown subscription id and for an unknown endpoint', a
   const endpoint = await getJson(fake, '/get/DriverAid.NotARealEndpoint');
   assert.equal(endpoint.status, 400);
   assert.match(endpoint.body.errorMessage, /DriverAid\.NotARealEndpoint/);
+});
+
+test('serves a working subscription, and subscription-only hides the position from /get', async (context) => {
+  // Why: both public TSW6 clients read the player position from /subscription rather than /get, so
+  // the bridge falls back to that shape. This scenario is the one that looks healthy through /get
+  // and still leaves the map empty - the failure the field-name guesses could not explain.
+  const fake = await createFakeTswApi({ scenario: 'subscription-only' });
+  context.after(() => fake.stop());
+
+  const viaGet = await getJson(fake, PLAYER_INFO);
+  assert.equal(viaGet.status, 200);
+  assert.equal(viaGet.body.Result, 'Success');
+  assert.equal(viaGet.body.Values.geoLocation, undefined, 'the position is deliberately absent here');
+  assert.ok(viaGet.body.Values.currentServiceName.length > 0);
+
+  const register = (id) => fetch(`${fake.baseUrl}/subscription/DriverAid.PlayerInfo?Subscription=${id}`, {
+    method: 'POST',
+    headers: { DTGCommKey: fake.key }
+  });
+  const remove = (id) => fetch(`${fake.baseUrl}/subscription/?Subscription=${id}`, {
+    method: 'DELETE',
+    headers: { DTGCommKey: fake.key }
+  });
+
+  const registered = await register(42);
+  assert.equal(registered.status, 200);
+  assert.equal((await registered.json()).Result, 'Success');
+
+  const read = await getJson(fake, '/subscription?Subscription=42');
+  assert.equal(read.status, 200);
+  assert.equal(read.body.RequestedSubscriptionID, 42);
+  assert.equal(read.body.Entries.length, 1);
+  const values = read.body.Entries[0].Values;
+  assert.ok(Number.isFinite(values.geoLocation.latitude));
+  assert.ok(Number.isFinite(values.geoLocation.longitude));
+  assert.equal(values.currentServiceName, viaGet.body.Values.currentServiceName);
+
+  // Removing it puts the id back to "unknown", which is what stops a stopped bridge from leaving a
+  // subscription behind on the game side.
+  assert.equal((await remove(42)).status, 200);
+  const after = await getJson(fake, '/subscription?Subscription=42');
+  assert.equal(after.status, 400);
+  assert.equal(after.body.errorCode, 'dtg.comm.NoSuchSubscription');
+
+  // Registering a path the game does not expose must not silently succeed.
+  const unknownPath = await fetch(`${fake.baseUrl}/subscription/DriverAid.NotARealEndpoint?Subscription=43`, {
+    method: 'POST',
+    headers: { DTGCommKey: fake.key }
+  });
+  assert.equal(unknownPath.status, 400);
+  assert.match((await unknownPath.json()).errorMessage, /NotARealEndpoint/);
 });
 
 test('the error-envelope scenario is HTTP 200 carrying Result "Error"', async (context) => {

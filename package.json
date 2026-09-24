@@ -1,6 +1,6 @@
 {
   "name": "xpanelocalize",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "LAN X-Plane 12 UDP / Train Sim World 6 HTTP API to WebSocket bridge and iPad-friendly moving-map EFB",
   "type": "module",

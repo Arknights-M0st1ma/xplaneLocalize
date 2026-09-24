@@ -55,7 +55,16 @@ internal sealed class TswApiClient : IDisposable
         var normalized = NormalizeBase(candidate, out var note);
         BaseUrl = normalized;
         BaseNote = note;
-        http = new HttpClient { Timeout = RequestTimeout };
+        http = new HttpClient(new SocketsHttpHandler
+        {
+            // The API lives on loopback: it must never go through the user's system proxy. A proxy
+            // that blackholes 127.0.0.1 turns every poll into a full one-second timeout, which looks
+            // exactly like "the game has no coordinates yet".
+            UseProxy = false,
+            ConnectTimeout = TimeSpan.FromSeconds(1),
+            PooledConnectionLifetime = TimeSpan.FromSeconds(30)
+        })
+        { Timeout = RequestTimeout };
     }
 
     /// <summary>Effective API base, without a trailing slash.</summary>
@@ -166,12 +175,31 @@ internal sealed class TswApiClient : IDisposable
 
     public Task<TswResponse> GetAsync(string path, CancellationToken token) => SendAsync(path, token);
 
-    public async Task<TswResponse> SendAsync(string path, CancellationToken token)
+    // ------------------------------------------------------------------ subscriptions
+    // /subscription is the API's push-ish surface: register a path once, then read every registered
+    // value back in a single request. Both public TSW6 clients (GarethLowe's tsw6-realtime-weather
+    // and TheJAG's tsw_connect) read the player position this way rather than with /get, so this is
+    // a documented shape of the same data that the bridge has to be able to fall back to
+    // (docs/TSW6-TELEMETRY.md §3.2).
+
+    public Task<TswResponse> SubscribeAsync(string node, string endpoint, int subscriptionId, CancellationToken token) =>
+        SendAsync(HttpMethod.Post,
+            $"/subscription/{EscapeNode(node)}.{Uri.EscapeDataString(endpoint)}?Subscription={subscriptionId}", token);
+
+    public Task<TswResponse> ReadSubscriptionAsync(int subscriptionId, CancellationToken token) =>
+        SendAsync($"/subscription?Subscription={subscriptionId}", token);
+
+    public Task<TswResponse> UnsubscribeAsync(int subscriptionId, CancellationToken token) =>
+        SendAsync(HttpMethod.Delete, $"/subscription/?Subscription={subscriptionId}", token);
+
+    public Task<TswResponse> SendAsync(string path, CancellationToken token) => SendAsync(HttpMethod.Get, path, token);
+
+    public async Task<TswResponse> SendAsync(HttpMethod method, string path, CancellationToken token)
     {
         var key = Key();
         if (key is null) return TswResponse.Failure("密钥不可用", KeyFileNote);
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, BaseUrl + path);
+        using var request = new HttpRequestMessage(method, BaseUrl + path);
         request.Headers.TryAddWithoutValidation(KeyHeader, key);
         try
         {

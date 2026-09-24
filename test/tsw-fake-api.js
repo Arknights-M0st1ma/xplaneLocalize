@@ -27,9 +27,10 @@
 //
 //   node test/tsw-fake-api.js
 //   node test/tsw-fake-api.js 40000
+//   node test/tsw-fake-api.js 31270 subscription-only   # position only in the subscription
 //   $env:EFB_TSW_KEY='my-key'; node test/tsw-fake-api.js
 //
-// Scenarios: ok | no-info | bad-key | error-envelope | slow | minimal | offline
+// Scenarios: ok | no-info | bad-key | error-envelope | slow | minimal | subscription-only | offline
 
 import http from 'node:http';
 import path from 'node:path';
@@ -107,6 +108,9 @@ const SCENARIOS = Object.freeze({
   slow: { info: true, payload: 'normal', delayMs: DEFAULT_SLOW_DELAY_MS },
   // Success envelopes holding renamed/missing fields and 3.4028e+38 sentinels.
   minimal: { info: true, payload: 'minimal' },
+  // /get/DriverAid.PlayerInfo answers, but only the subscription carries the position — the shape
+  // the two public TSW6 clients work around by reading /subscription instead of /get.
+  'subscription-only': { info: true, payload: 'subscriptionOnly' },
   // The listener is closed, so connections are refused.
   offline: { info: false, payload: 'normal', closed: true }
 });
@@ -174,6 +178,15 @@ function normalizeEndpoint(endpoint) {
 // objects while the distance fields are bare numbers -- the asymmetry is in the
 // third-party docs and is exactly the kind of thing a parser trips over.
 function playerInfoValues(state, payload) {
+  if (payload === 'subscriptionOnly') {
+    // Same facts as the normal payload, minus the position: this is the shape where a client that
+    // only reads /get sees a healthy API and still cannot draw a map.
+    return {
+      currentTile: { x: state.currentTile.x, y: state.currentTile.y },
+      currentServiceName: state.currentServiceName,
+      playerProfileName: state.playerProfileName
+    };
+  }
   if (payload === 'minimal') {
     // Hostile shape: no geoLocation at all, coordinates renamed to lat/lon, and
     // the useless game-internal tile grid as a sentinel.
@@ -301,6 +314,8 @@ export async function createFakeTswApi(options = {}) {
   const counts = Object.create(null);
   const sockets = new Set();
   const timers = new Map();
+  // Subscription id -> registered paths. Empty until a client registers one.
+  const subscriptions = new Map();
 
   let scenario = 'ok';
   let delayMs = 0;
@@ -352,7 +367,7 @@ export async function createFakeTswApi(options = {}) {
     sendJson(res, 200, { Result: 'Success', Values: builder(payload) }, record);
   }
 
-  function route(pathname, res, record, profile) {
+  function route(pathname, method, requestUrl, res, record, profile) {
     if (pathname === '/info') {
       if (!profile.info) {
         // /info is NOT in the reverse-engineered spec (it ends with a TODO), so
@@ -387,10 +402,59 @@ export async function createFakeTswApi(options = {}) {
       routeGet(trimSlashes(pathname.slice('/get/'.length)), res, record, profile.payload);
       return;
     }
-    if (pathname === '/listsubscriptions' || pathname === '/subscription' || pathname.startsWith('/subscription/')) {
-      // The fake never invents a working subscription: the only confirmed
-      // subscription fact is the "unknown id" error, and the MVP polls /get.
-      sendJson(res, 400, NO_SUCH_SUBSCRIPTION_BODY, record);
+    if (pathname === '/listsubscriptions') {
+      sendJson(res, 200, { Result: 'Success', Subscriptions: [...subscriptions.keys()] }, record);
+      return;
+    }
+    if (pathname === '/subscription' || pathname === '/subscription/') {
+      // Reads and removes a whole subscription id. Both spellings appear in the wild: the public
+      // clients read "/subscription?Subscription=N" and remove "/subscription/?Subscription=N".
+      const id = Number.parseInt(requestUrl.searchParams.get('Subscription') ?? '', 10);
+      const registered = Number.isInteger(id) ? subscriptions.get(id) : undefined;
+      if (method === 'DELETE') {
+        subscriptions.delete(id);
+        sendJson(res, 200, { Result: 'Success' }, record);
+        return;
+      }
+      if (!registered) {
+        // An unknown id is the one subscription fact the spec confirms.
+        sendJson(res, 400, NO_SUCH_SUBSCRIPTION_BODY, record);
+        return;
+      }
+      sendJson(res, 200, {
+        RequestedSubscriptionID: id,
+        Entries: registered.map((path) => ({
+          // 'subscription-only' is the profile where /get hides the position: the subscription is
+          // exactly where that profile puts it back, so the envelope always serves the full payload.
+          Values: endpointBuilders[path]
+            ? endpointBuilders[path](profile.payload === 'subscriptionOnly' ? 'normal' : profile.payload)
+            : {}
+        }))
+      }, record);
+      return;
+    }
+    if (pathname.startsWith('/subscription/')) {
+      // Registers or removes one path on a subscription id.
+      const id = Number.parseInt(requestUrl.searchParams.get('Subscription') ?? '', 10);
+      if (!Number.isInteger(id)) {
+        sendJson(res, 400, NO_SUCH_SUBSCRIPTION_BODY, record);
+        return;
+      }
+      const target = trimSlashes(pathname.slice('/subscription/'.length));
+      if (method === 'DELETE') {
+        const remaining = subscriptions.get(id)?.filter((item) => item !== target);
+        if (remaining) subscriptions.set(id, remaining);
+        sendJson(res, 200, { Result: 'Success' }, record);
+        return;
+      }
+      if (!endpointBuilders[target]) {
+        sendJson(res, 400, { ...NO_SUCH_ENDPOINT_BODY, errorMessage: `${NO_SUCH_ENDPOINT_BODY.errorMessage}: ${target}` }, record);
+        return;
+      }
+      const paths = subscriptions.get(id) ?? [];
+      if (!paths.includes(target)) paths.push(target);
+      subscriptions.set(id, paths);
+      sendJson(res, 200, { Result: 'Success' }, record);
       return;
     }
     sendJson(res, 404, { ...NO_SUCH_ROUTE_BODY, errorMessage: `${NO_SUCH_ROUTE_BODY.errorMessage}: ${pathname}` }, record);
@@ -436,11 +500,16 @@ export async function createFakeTswApi(options = {}) {
       sendJson(res, 200, {}, record);
       return;
     }
-    if (req.method !== 'GET') {
+    // Subscriptions are the only write routes this client uses (register, read, remove); everything
+    // else stays GET-only, which is what the reverse-engineered spec shows.
+    const subscriptionRoute = pathname === '/subscription' || pathname === '/subscription/'
+      || pathname.startsWith('/subscription/') || pathname === '/listsubscriptions';
+    const writeAllowed = subscriptionRoute && (req.method === 'POST' || req.method === 'DELETE');
+    if (req.method !== 'GET' && !writeAllowed) {
       sendJson(res, 501, { ...NOT_IMPLEMENTED_BODY, errorMessage: `${NOT_IMPLEMENTED_BODY.errorMessage} (got ${req.method} ${pathname})` }, record);
       return;
     }
-    route(pathname, res, record, profile);
+    route(pathname, req.method, requestUrl, res, record, profile);
   }
 
   const server = http.createServer((req, res) => {
@@ -625,7 +694,8 @@ const isManualRun = isMainModule && process.env.NODE_TEST_CONTEXT === undefined;
 if (isManualRun) {
   const requested = Number.parseInt(process.argv[2] ?? '', 10);
   const port = Number.isInteger(requested) ? requested : DEFAULT_PORT;
-  const fake = await createFakeTswApi({ port, fallbackToEphemeral: true });
+  const scenario = process.argv[3] ?? 'ok';
+  const fake = await createFakeTswApi({ port, fallbackToEphemeral: true, scenario });
   const key = fake.key;
   console.log(`TSW6 fake API listening on ${fake.baseUrl}`);
   if (fake.port !== port) console.log(`(port ${port} was busy, so an ephemeral port was used instead)`);
@@ -635,6 +705,8 @@ if (isManualRun) {
   console.log(`  curl -s -H "DTGCommKey: ${key}" ${fake.baseUrl}/info`);
   console.log(`  curl -s -H "DTGCommKey: ${key}" ${fake.baseUrl}/get/DriverAid.PlayerInfo`);
   console.log(`  curl -s -H "DTGCommKey: ${key}" "${fake.baseUrl}/get/CurrentDrivableActor.Function.HUD_GetSpeed"`);
+  console.log(`  curl -s -X POST -H "DTGCommKey: ${key}" "${fake.baseUrl}/subscription/DriverAid.PlayerInfo?Subscription=1"`);
+  console.log(`  curl -s -H "DTGCommKey: ${key}" "${fake.baseUrl}/subscription?Subscription=1"`);
   console.log(`point a client at EFB_TSW_BASE=${fake.baseUrl} and EFB_TSW_KEY=${key}`);
   console.log('Ctrl+C to stop.');
   const shutdown = async () => {

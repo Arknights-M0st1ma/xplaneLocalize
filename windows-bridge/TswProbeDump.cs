@@ -139,7 +139,8 @@ internal static class TswProbeDump
         Line("── 5. 结论 ──");
         var position = await FindPositionAsync(client, token);
         Line(position is null
-            ? "没有找到可用的位置端点：桥接器在列车模式下会显示“找不到位置端点”。请把上面的端点清单发回以便修正候选名。"
+            ? "没有找到可用的位置端点（已试 /get 的候选端点与 /subscription 订阅）。"
+                + "游戏停在主菜单或加载中时本来就没有坐标，请进入一条线路后重跑；仍然没有的话，请把上面的端点清单发回以便修正候选名。"
             : $"可用的位置端点：{position}");
         Line("把本文件完整发回即可；其中不含密钥，但可能含你的账号名（playerProfileName），如介意可先删掉那几行。");
         Write(output, report);
@@ -152,9 +153,22 @@ internal static class TswProbeDump
         {
             var response = await client.GetAsync(node, endpoint, token);
             if (!response.Ok) continue;
-            var latitude = TswMapper.FindDeep(response.Values, ["latitude", "lat", "Latitude"]);
-            var longitude = TswMapper.FindDeep(response.Values, ["longitude", "lon", "Longitude"]);
-            if (latitude is double lat && longitude is double lon) return $"{node}.{endpoint} → {lat:0.00000}, {lon:0.00000}";
+            if (TswMapper.Coordinates(response.Values) is (double lat, double lon))
+                return $"{node}.{endpoint} → {lat:0.00000}, {lon:0.00000}";
+        }
+        // The subscription shape, in the same order the bridge uses it: some TSW6 builds expose the
+        // position only here, and a report that stops at /get would call that "no position endpoint".
+        const int subscriptionId = 4242;
+        foreach (var (_, node, endpoint) in PositionCandidates)
+        {
+            var registered = await client.SubscribeAsync(node, endpoint, subscriptionId, token);
+            if (!registered.Ok) continue;
+            var read = await client.ReadSubscriptionAsync(subscriptionId, token);
+            if (!read.Ok) continue;
+            var values = TswMapper.SubscriptionValues(read.Root ?? read.Values);
+            if (values is null) continue;
+            if (TswMapper.Coordinates(values) is (double subLat, double subLon))
+                return $"{node}.{endpoint}（订阅）→ {subLat:0.00000}, {subLon:0.00000}";
         }
         return null;
     }

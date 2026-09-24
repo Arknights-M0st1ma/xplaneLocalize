@@ -549,3 +549,17 @@ function updateTelemetry(data) {
 7. Steam《Train Sim World® 6》讨论《API Key》（2025-11-13，TSW6 的 `CommAPIKey.txt` 路径与生成条件）：<https://steamcommunity.com/app/3656800/discussions/0/682985658886843643/>
 8. Train Sim Community Mod《TSW WebSocket API》（可选替代方案）：<https://www.trainsimcommunity.com/mods/c3-train-sim-world/c109-other/i5723-tsw-web-socket-api>
 9. ThirdRails 官网（成品对照）：<https://thirdrails.org/>
+
+## 11. 实测修正记录
+
+以下三条是接入过程中的实测结论，与前面基于公开文档的推断有出入，写在这里以免后来者重新踩一遍。
+
+| 编号 | 原先的推断 | 实测结论 | 影响 |
+| --- | --- | --- | --- |
+| R1 | 位置探测失败是"字段名不对" | 更常见的原因是**探测只做了一次**：桥接器通常先于游戏启动，或游戏还停在主菜单（此时 API 没有坐标），一次失败就被当成永久失败。设置窗口的"测试连接"是即时执行的，所以会出现"测试能读到、桌面端一直读不到" | 位置探测必须按冷却时间重试；"API 正常但没有坐标"不能进入失败退避，否则进入线路后要等半分钟才出点 |
+| R2 | `GET /get/DriverAid.PlayerInfo` 一定返回 `Values.geoLocation` | 部分 TSW6 版本的 `/get` 响应里没有坐标，位置只在 `/subscription` 的 `Entries[].Values` 里。两个公开的 TSW6 客户端都只用订阅取位置，`/get` 这条路只有 TSW5 时代的文档背书 | 必须实现订阅回退（`POST /subscription/{node}.{endpoint}?Subscription=N` → `GET /subscription?Subscription=N`），并在状态里标出 `（订阅）` |
+| R3 | 用默认 `HttpClient` 直连回环地址没问题 | 默认会走**系统代理**：当代理把 `127.0.0.1` 黑洞化时，每次轮询都要等满 1 秒超时，表现与"游戏没有坐标"完全一致 | TSW 客户端必须 `UseProxy = false`，并把连接超时压到 1 秒 |
+
+完整的数据源实现见 `windows-bridge/TswApiClient.cs` 与 `windows-bridge/TswTelemetrySource.cs`；
+订阅回退与"位置只在订阅里"的场景由 `test/tsw-fake-api.js`（`subscription-only`）和
+`XPlaneEfbBridge.exe --config-selftest` 的自检覆盖。

@@ -642,6 +642,34 @@ internal static class ConfigSelfTest
         Check("TSW：空字符串字段视为缺失",
             TswMapper.Find(JsonNode.Parse("""{ "a": "", "b": 5 }""") as JsonObject, ["a", "b"])?.GetValue<int>() == 5);
 
+        // The subscription envelope: {RequestedSubscriptionID, Entries:[{Values:{…}}]}. Both public
+        // TSW6 clients read the player position from here rather than from /get, so the bridge has to
+        // understand it. The first entry deliberately has no coordinate: the payload that matters is
+        // not necessarily Entries[0].
+        var subscriptionEnvelope = JsonNode.Parse("""
+        {
+          "RequestedSubscriptionID": 7,
+          "Entries": [
+            { "Values": { "currentTile": { "x": 1, "y": 2 } } },
+            { "Values": { "geoLocation": { "latitude": 47.8370, "longitude": 12.9752 }, "currentServiceName": "RE 4871" } }
+          ]
+        }
+        """) as JsonObject;
+        var subscriptionValues = TswMapper.SubscriptionValues(subscriptionEnvelope);
+        var subscriptionPosition = subscriptionValues is null ? null : TswMapper.Coordinates(subscriptionValues);
+        Check("TSW：订阅信封里取出带坐标的那一条",
+            subscriptionPosition is (double subLat, double subLon)
+            && Math.Abs(subLat - 47.8370) < 1e-9 && Math.Abs(subLon - 12.9752) < 1e-9
+            && (string?)subscriptionValues?["currentServiceName"] == "RE 4871",
+            subscriptionValues is null ? "没取到" : TswMapper.DescribeFields(subscriptionValues));
+        Check("TSW：深度搜索会进入数组", TswMapper.Coordinates(subscriptionEnvelope) is not null);
+        Check("TSW：订阅信封整体没有坐标时返回空",
+            TswMapper.SubscriptionValues(JsonNode.Parse("""{ "RequestedSubscriptionID": 7, "Entries": [ { "Values": { "currentTile": { "x": 1, "y": 2 } } } ] }""") as JsonObject) is null,
+            "主菜单里就是这样：API 正常，但没有坐标");
+        Check("TSW：字段诊断只列名字不列值",
+            TswMapper.DescribeFields(JsonNode.Parse("""{ "geoLocation": { "latitude": 1, "longitude": 2 }, "currentServiceName": "x" }""") as JsonObject)
+                == "geoLocation、currentServiceName");
+
         // Switch hygiene: Publish merges into a snapshot that never shrinks, so the previous
         // source's fields have to be dropped explicitly or the old altitude survives.
         var switchServer = new LocalWebServer(new BridgeConfig());
@@ -721,6 +749,42 @@ internal static class ConfigSelfTest
                 && Math.Abs((double)fakeFrame["groundSpeedKmh"] - 84.3) < 0.05, $"{fakeFrame.GetValueOrDefault("groundSpeedKmh")} km/h");
             Check("TSW 假 API：限速可读", fakeFrame.ContainsKey("limitKmh") && fakeFrame.ContainsKey("distanceToNextLimitM"));
             Check("TSW 假 API：信号与车次可读", fakeFrame.ContainsKey("signalAspect") && fakeFrame.ContainsKey("currentServiceName"));
+
+            // Subscription fallback plumbing: register a path, read the envelope back, pull the
+            // values out of it, then remove it again (a stopped bridge must not leave one behind).
+            const int subscriptionId = 4242;
+            var subscribed = await fakeClient.SubscribeAsync("DriverAid", "PlayerInfo", subscriptionId, CancellationToken.None);
+            Check("TSW 假 API：订阅可注册", subscribed.Ok, subscribed.Message);
+            var subscriptionRead = await fakeClient.ReadSubscriptionAsync(subscriptionId, CancellationToken.None);
+            var subscribedValues = TswMapper.SubscriptionValues(subscriptionRead.Root ?? subscriptionRead.Values);
+            Check("TSW 假 API：订阅里能读到坐标",
+                subscriptionRead.Ok && subscribedValues is not null && TswMapper.Coordinates(subscribedValues) is not null,
+                subscriptionRead.Ok ? TswMapper.DescribeFields(subscribedValues) : subscriptionRead.Message);
+            Check("TSW 假 API：订阅可注销", (await fakeClient.UnsubscribeAsync(subscriptionId, CancellationToken.None)).Ok);
+
+            // The whole runtime path in one check: discovery → poll → publish. The self-test otherwise
+            // only exercises the mapper and the client, which is how a broken polling loop could stay
+            // invisible while every unit check passed.
+            var loopConfig = new BridgeConfig
+            {
+                TelemetrySource = BridgeConfig.SourceTsw,
+                TswApiUrl = fakeBase,
+                TswApiKeyPath = fakeKeyPath,
+                TswPollHz = 4
+            };
+            var loopFrames = new List<Dictionary<string, object>>();
+            using (var loopSource = new TswTelemetrySource(loopConfig, frame => { lock (loopFrames) loopFrames.Add(frame); }))
+            {
+                loopSource.Start();
+                var deadline = DateTime.UtcNow.AddSeconds(6);
+                bool Any() { lock (loopFrames) return loopFrames.Count > 0; }
+                while (DateTime.UtcNow < deadline && !Any()) await Task.Delay(100);
+                await loopSource.StopAsync();
+            }
+            var loopFrame = loopFrames.Count > 0 ? loopFrames[0] : null;
+            Check("TSW 假 API：轮询循环能出帧",
+                loopFrame is not null && (double)loopFrame["latitude"] == 51.4704,
+                loopFrame is null ? "6 秒内没有帧" : $"{loopFrame["latitude"]}, {loopFrame["longitude"]} · {loopFrame["source"]}");
 
             // Wrong key must be a clean, credential-free failure rather than an exception.
             var wrongKeyPath = Path.Combine(directory, "wrong-key.txt");

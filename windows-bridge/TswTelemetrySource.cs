@@ -153,24 +153,85 @@ internal static class TswMapper
     public static bool Plausible(double value) =>
         double.IsFinite(value) && Math.Abs(value) < UndefinedTolerance && Math.Abs(value - Undefined) > 1;
 
-    /// <summary>Finds a coordinate-shaped number anywhere under the given path, so a payload that
-    /// nests the position differently than documented still yields a position. The depth limit keeps
-    /// a large payload (the driver-aid blob has arrays several levels deep) from turning this into a
-    /// full tree walk on every frame.</summary>
-    public static double? FindDeep(JsonObject? node, string[] keys, int depth = 3)
+    /// <summary>Finds a coordinate-shaped number anywhere under the given node, so a payload that
+    /// nests the position differently than documented still yields a position. Arrays are searched
+    /// as well: the subscription envelope carries its values in <c>Entries[]</c> and the driver-aid
+    /// blob has look-ahead arrays of its own. The depth limit keeps that from becoming an unbounded
+    /// tree walk on every frame.</summary>
+    public static double? FindDeep(JsonObject? node, string[] keys, int depth = 5) =>
+        node is null ? null : FindDeepNode(node, keys, depth);
+
+    private static double? FindDeepNode(JsonNode? node, string[] keys, int depth)
     {
-        var direct = Number(Find(node, keys));
-        if (direct is not null) return direct;
-        if (node is null || depth <= 0) return null;
-        foreach (var item in node)
+        if (node is JsonObject obj)
         {
-            if (item.Value is JsonObject child)
+            var direct = Number(Find(obj, keys));
+            if (direct is not null) return direct;
+            if (depth <= 0) return null;
+            foreach (var item in obj)
             {
-                var nested = FindDeep(child, keys, depth - 1);
+                var nested = FindDeepNode(item.Value, keys, depth - 1);
                 if (nested is not null) return nested;
             }
+            return null;
+        }
+        if (node is not JsonArray array || depth <= 0) return null;
+        foreach (var item in array)
+        {
+            var nested = FindDeepNode(item, keys, depth - 1);
+            if (nested is not null) return nested;
         }
         return null;
+    }
+
+    /// <summary>True when this exact object carries a usable latitude/longitude pair (no search).</summary>
+    public static bool HasCoordinate(JsonObject? node)
+    {
+        var latitude = Number(Find(node, LatitudeKeys));
+        if (latitude is not double lat || lat is < -90 or > 90) return false;
+        var longitude = Number(Find(node, LongitudeKeys));
+        return longitude is double lon && lon is >= -180 and <= 180;
+    }
+
+    /// <summary>The coordinate pair carried anywhere inside this payload, or null when it holds no
+    /// usable one (depth-limited, arrays included, sentinels and impossible values rejected). Shared
+    /// by discovery, the subscription fallback and the settings window's test button, so all three
+    /// agree on what "this payload is a position" means.</summary>
+    public static (double Latitude, double Longitude)? Coordinates(JsonObject? node)
+    {
+        if (FindDeep(node, LatitudeKeys) is not double lat || lat is < -90 or > 90) return null;
+        if (FindDeep(node, LongitudeKeys) is not double lon || lon is < -180 or > 180) return null;
+        return (lat, lon);
+    }
+
+    public static bool HasPosition(JsonObject? node) => Coordinates(node) is not null;
+
+    /// <summary>Pulls the value object out of a <c>/subscription</c> response. The envelope is
+    /// <c>{RequestedSubscriptionID, Entries:[{Values:{…}}, …]}</c>, and the entry that carries a
+    /// coordinate is the position one. Returns null when no entry holds a position, so the caller
+    /// can report "not in a route yet" instead of drawing a marker at 0,0.</summary>
+    public static JsonObject? SubscriptionValues(JsonObject? root)
+    {
+        if (root is null) return null;
+        if (root["Entries"] is not JsonArray entries) return HasPosition(root) ? root : null;
+        foreach (var entry in entries)
+        {
+            var values = entry is JsonObject item ? item["Values"] as JsonObject ?? item : null;
+            if (values is null) continue;
+            if (HasPosition(values)) return values;
+        }
+        return null;
+    }
+
+    /// <summary>Field names of a payload, for the settings window's failure report. Names only,
+    /// never values: a screenshot of the dialog must not be able to leak a key or a profile name.</summary>
+    public static string DescribeFields(JsonObject? node, int max = 12)
+    {
+        if (node is null) return "（没有 Values 对象）";
+        var names = node.Select(item => item.Key).Where(name => name.Length > 0).Take(max).ToList();
+        if (names.Count == 0) return "（空对象）";
+        var text = string.Join("、", names);
+        return node.Count > names.Count ? $"{text}…（共 {node.Count} 个）" : text;
     }
 }
 
@@ -192,6 +253,8 @@ internal static class TswMapper
 internal sealed class TswTelemetrySource : IDisposable
 {
     private static readonly TimeSpan NodeRetryInterval = TimeSpan.FromSeconds(30);
+    // Discovery used to be one-shot; this is how long it waits before trying again.
+    private static readonly TimeSpan DiscoveryRetryInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan MinBackoff = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan MaxBackoff = TimeSpan.FromSeconds(30);
 
@@ -204,11 +267,24 @@ internal sealed class TswTelemetrySource : IDisposable
     private const string DriverAidNodeDefault = "DriverAid";
     private const string DriverAidEndpointDefault = "Data";
 
+    /// <summary>Position candidates in the order the third-party docs attest them. Shared by /get
+    /// discovery and by the subscription fallback so the two can never drift apart.</summary>
+    internal static readonly (string Node, string Endpoint)[] PositionCandidates =
+    [
+        (PositionNodeDefault, PositionEndpointDefault),
+        ("DriverAid", "Data"),
+        ("CurrentDrivableActor", "LatLon"),
+        ("CurrentDrivableActor", "Function.LatLon")
+    ];
+
     private readonly BridgeConfig config;
     private readonly Action<Dictionary<string, object>> publish;
     private readonly Action<string>? log;
     private readonly object gate = new();
     private readonly List<Action<JsonObject?, JsonObject?, JsonObject?>> subscribers = [];
+    // A random id keeps this process from fighting another tool (ThirdRails, a controller app) that
+    // is already subscribed on the same game.
+    private readonly int subscriptionId = Random.Shared.Next(1, ushort.MaxValue);
 
     private CancellationTokenSource? cancellation;
     private Task? loop;
@@ -218,7 +294,11 @@ internal sealed class TswTelemetrySource : IDisposable
     // Endpoint state. "Live" means the last call succeeded; when it turns false the name is
     // re-discovered after a cooldown instead of being hammered four times a second.
     private bool positionLive;
-    private bool positionGaveUp;
+    private bool positionViaSubscription;
+    // False when the last discovery could not reach the API at all (game not running): that is a
+    // failure and keeps the exponential backoff, while "the API answered but has no coordinate yet"
+    // is not and must not back off.
+    private bool positionReachable;
     private string positionNode = PositionNodeDefault;
     private string positionEndpoint = PositionEndpointDefault;
     private DateTimeOffset positionRetryAt;
@@ -269,7 +349,10 @@ internal sealed class TswTelemetrySource : IDisposable
                 ["keyNote"] = client?.KeyFileNote ?? "",
                 ["endpoints"] = new Dictionary<string, object>
                 {
-                    ["position"] = positionLive ? $"{positionNode}.{positionEndpoint}" : "",
+                    ["position"] = positionLive
+                        ? $"{positionNode}.{positionEndpoint}{(positionViaSubscription ? "（订阅）" : "")}"
+                        : "",
+                    ["positionMode"] = positionViaSubscription ? "subscription" : "get",
                     ["speed"] = speedLive ? $"{speedNode}.{speedEndpoint}" : "",
                     ["driverAid"] = driverAidLive ? $"{driverAidNode}.{driverAidEndpoint}" : ""
                 }
@@ -304,6 +387,16 @@ internal sealed class TswTelemetrySource : IDisposable
         loop = null;
         token?.Dispose();
         cancellation = null;
+        // Best effort: a subscription left behind keeps accumulating on the game's side.
+        if (positionViaSubscription && client is not null)
+        {
+            try
+            {
+                using var unsubscribe = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                await client.UnsubscribeAsync(subscriptionId, unsubscribe.Token);
+            }
+            catch (Exception) { }
+        }
         lock (gate)
         {
             client?.Dispose();
@@ -319,11 +412,11 @@ internal sealed class TswTelemetrySource : IDisposable
         {
             var started = Environment.TickCount64;
             var api = Client();
-            bool published;
+            var outcome = PollOutcome.Failed;
             try
             {
-                published = await PollOnceAsync(api, token);
-                if (published) backoff = MinBackoff;
+                outcome = await PollOnceAsync(api, token);
+                if (outcome != PollOutcome.Failed) backoff = MinBackoff;
                 else if (lastError.Length == 0) lock (gate) lastError = api.KeyConfigured ? lastNote : api.KeyFileNote;
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested)
@@ -338,13 +431,15 @@ internal sealed class TswTelemetrySource : IDisposable
                     lastError = error.GetType().Name + "：" + error.Message;
                     lastNote = "轮询时出错，正在重试。";
                 }
-                published = false;
+                outcome = PollOutcome.Failed;
             }
 
             var elapsed = Environment.TickCount64 - started;
             var interval = 1000.0 / PollHz;
             int delay;
-            if (published)
+            // "Answered, but there is no position yet" (main menu, loading screen) is not a failure:
+            // backing off there would make the map wait half a minute after a route finally loads.
+            if (outcome is PollOutcome.Published or PollOutcome.NoPosition)
             {
                 delay = (int)Math.Max(50, interval - elapsed);
             }
@@ -357,6 +452,10 @@ internal sealed class TswTelemetrySource : IDisposable
             catch (OperationCanceledException) { return; }
         }
     }
+
+    /// <summary>What a polling tick achieved. The middle case exists so that "the API is fine, the
+    /// game just has no coordinate yet" does not trigger the failure backoff.</summary>
+    private enum PollOutcome { Published, NoPosition, Failed }
 
     /// <summary>The settings window edits the same configuration instance, so a changed URL or key
     /// path rebuilds the client instead of waiting for a restart.</summary>
@@ -375,45 +474,39 @@ internal sealed class TswTelemetrySource : IDisposable
         }
     }
 
-    /// <summary>One polling tick. Returns true when a frame was published.</summary>
-    private async Task<bool> PollOnceAsync(TswApiClient api, CancellationToken token)
+    /// <summary>One polling tick.</summary>
+    private async Task<PollOutcome> PollOnceAsync(TswApiClient api, CancellationToken token)
     {
         if (!positionLive)
         {
-            if (positionGaveUp) return false;
-            if (positionRetryAt > DateTimeOffset.UtcNow) return false;
-            await DiscoverPositionAsync(api, token);
-            if (!positionLive) return false;
+            // Discovery is retried on a cooldown. It used to be one-shot, and the first probe almost
+            // always runs while the game is still on the main menu - where the API has no coordinate
+            // yet. One failure there left the bridge blind until the service was restarted, while
+            // the settings window's own test kept succeeding, which made it look like a field-name
+            // problem (docs/TSW6-TELEMETRY.md §3.4).
+            if (positionRetryAt > DateTimeOffset.UtcNow) return positionReachable ? PollOutcome.NoPosition : PollOutcome.Failed;
+            var answered = await DiscoverPositionAsync(api, token);
+            if (!positionLive) return answered ? PollOutcome.NoPosition : PollOutcome.Failed;
         }
 
-        var position = await api.GetAsync(positionNode, positionEndpoint, token);
-        if (!position.Ok)
-        {
-            // The API had answered before, so this is a real failure rather than a wrong name:
-            // clear "live" and let the cooldown re-discover in case the game changed its routes.
-            positionLive = false;
-            positionGaveUp = false;
-            positionRetryAt = DateTimeOffset.UtcNow + NodeRetryInterval;
-            Note("位置读取失败：" + position.Message);
-            lock (gate) lastError = position.Message;
-            return false;
-        }
+        var position = await ReadPositionAsync(api, token);
+        if (position is null) return PollOutcome.NoPosition;
 
         var speed = await OptionalAsync(api, true);
         var driverAid = await OptionalAsync(api, false);
 
-        var frame = TswMapper.Map(position.Values, speed, driverAid);
+        var frame = TswMapper.Map(position, speed, driverAid);
         if (!frame.ContainsKey("latitude"))
         {
             Note("响应里没有可用的经纬度（可能还在主菜单或加载中）。");
-            return false;
+            return PollOutcome.NoPosition;
         }
         frame["source"] = $"{positionNode}.{positionEndpoint}";
         frame["apiUrl"] = api.BaseUrl;
 
         foreach (var subscriber in SubscriberSnapshot())
         {
-            try { subscriber(position.Values, speed, driverAid); } catch { }
+            try { subscriber(position, speed, driverAid); } catch { }
         }
 
         lock (gate)
@@ -426,7 +519,53 @@ internal sealed class TswTelemetrySource : IDisposable
                 : "运行中。";
         }
         publish(frame);
-        return true;
+        return PollOutcome.Published;
+    }
+
+    /// <summary>Reads the position payload for this tick: the plain /get endpoint, or the
+    /// subscription envelope when discovery found the position there. Returns null when this tick has
+    /// no position, which is a normal state while the game sits in a menu.</summary>
+    private async Task<JsonObject?> ReadPositionAsync(TswApiClient api, CancellationToken token)
+    {
+        if (!positionViaSubscription)
+        {
+            var response = await api.GetAsync(positionNode, positionEndpoint, token);
+            if (response.Ok) return response.Values;
+            // The API had answered before, so this is a real failure rather than a wrong name: clear
+            // "live" and let the cooldown re-discover in case the game changed its routes.
+            lock (gate)
+            {
+                positionLive = false;
+                positionRetryAt = DateTimeOffset.UtcNow + NodeRetryInterval;
+                lastError = response.Message;
+            }
+            Note("位置读取失败：" + response.Message);
+            return null;
+        }
+
+        var subscription = await api.ReadSubscriptionAsync(subscriptionId, token);
+        if (!subscription.Ok)
+        {
+            lock (gate)
+            {
+                positionLive = false;
+                positionViaSubscription = false;
+                positionRetryAt = DateTimeOffset.UtcNow + NodeRetryInterval;
+                lastError = subscription.Message;
+            }
+            Note("读订阅失败：" + subscription.Message);
+            return null;
+        }
+
+        var values = TswMapper.SubscriptionValues(subscription.Root ?? subscription.Values);
+        if (values is null)
+        {
+            // The route answered but holds no coordinate yet. Keep the subscription instead of
+            // tearing it down; the next tick retries immediately.
+            Note("订阅里还没有经纬度（可能还在主菜单或加载中）。");
+            return null;
+        }
+        return values;
     }
 
     private Action<JsonObject?, JsonObject?, JsonObject?>[] SubscriberSnapshot()
@@ -513,37 +652,85 @@ internal sealed class TswTelemetrySource : IDisposable
 
     /// <summary>Position endpoint discovery. The candidate list is ordered by how well each name is
     /// attested in the third-party documentation, and a candidate is accepted only when the response
-    /// really carries a coordinate — a node that exists but holds something else is not a position.</summary>
-    private async Task DiscoverPositionAsync(TswApiClient api, CancellationToken token)
+    /// really carries a coordinate — a node that exists but holds something else is not a position.
+    /// When no /get candidate carries one, the subscription shape is tried: both public TSW6 clients
+    /// read the player position from /subscription rather than /get, so a game build whose plain
+    /// endpoint does not expose <c>geoLocation</c> still works.</summary>
+    private async Task<bool> DiscoverPositionAsync(TswApiClient api, CancellationToken token)
     {
-        var candidates = new (string Node, string Endpoint)[]
-        {
-            (PositionNodeDefault, PositionEndpointDefault),
-            ("DriverAid", "Data"),
-            ("CurrentDrivableActor", "LatLon"),
-            ("CurrentDrivableActor", "Function.LatLon")
-        };
-
-        foreach (var (node, endpoint) in candidates)
+        var answered = false;
+        foreach (var (node, endpoint) in PositionCandidates)
         {
             var probe = await api.GetAsync(node, endpoint, token);
             if (!probe.Ok) continue;
-            var latitude = TswMapper.FindDeep(probe.Values, ["latitude", "lat", "Latitude"]);
-            if (latitude is not double lat || lat is < -90 or > 90) continue;
+            answered = true;
+            if (!TswMapper.HasPosition(probe.Values)) continue;
             lock (gate)
             {
                 positionNode = node;
                 positionEndpoint = endpoint;
+                positionViaSubscription = false;
                 positionLive = true;
-                positionGaveUp = false;
+                positionReachable = true;
+                positionRetryAt = default;
             }
             Note($"已定位位置端点：{node}.{endpoint}");
-            return;
+            return true;
         }
 
-        positionGaveUp = true;
-        Note("找不到可用的位置端点：候选 DriverAid.PlayerInfo、DriverAid.Data、CurrentDrivableActor.LatLon 都没有返回经纬度。请用 --tsw-probe 查看游戏实际暴露的端点清单。");
-        log?.Invoke(lastNote);
+        var subscription = await TrySubscriptionAsync(api, token);
+        if (subscription.Found) return true;
+        answered |= subscription.Answered;
+
+        // Not a hard stop: the usual reason is that the game is still in a menu, and the retry below
+        // is what lets the map come alive once a route is loaded.
+        var tried = string.Join("、", PositionCandidates.Select(item => $"{item.Node}.{item.Endpoint}"));
+        var message = answered
+            ? $"暂时读不到位置：已试 {tried} 与 /subscription，游戏返回了响应但没有坐标。"
+                + "在主菜单或加载中就是这样，进入线路后会自动开始；若长时间没有，请用 --tsw-probe 查看游戏实际暴露的端点清单。"
+            : $"连不上 TSW6 API（{api.BaseUrl}）：游戏没在运行，或启动项里没有 -HTTPAPI。"
+                + "游戏启动后会自动重试，不需要重启本程序。";
+        lock (gate)
+        {
+            positionReachable = answered;
+            positionRetryAt = DateTimeOffset.UtcNow + DiscoveryRetryInterval;
+            lastNote = message;
+        }
+        log?.Invoke(message);
+        return answered;
+    }
+
+    /// <summary>Registers the candidate paths on one subscription and reads them back. Both public
+    /// TSW6 clients get the player position this way, so this is the second documented shape of the
+    /// same data rather than a guess (docs/TSW6-TELEMETRY.md §3.2).</summary>
+    private async Task<(bool Found, bool Answered)> TrySubscriptionAsync(TswApiClient api, CancellationToken token)
+    {
+        var answered = false;
+        foreach (var (node, endpoint) in PositionCandidates)
+        {
+            var registered = await api.SubscribeAsync(node, endpoint, subscriptionId, token);
+            if (!registered.Ok) continue;
+            answered = true;
+            var read = await api.ReadSubscriptionAsync(subscriptionId, token);
+            if (!read.Ok) continue;
+            answered = true;
+            var values = TswMapper.SubscriptionValues(read.Root ?? read.Values);
+            if (values is null) continue;
+            lock (gate)
+            {
+                positionNode = node;
+                positionEndpoint = endpoint;
+                positionViaSubscription = true;
+                positionLive = true;
+                positionReachable = true;
+                positionRetryAt = default;
+            }
+            var message = $"已定位位置端点：{node}.{endpoint}（订阅）";
+            lock (gate) lastNote = message;
+            log?.Invoke(message);
+            return (true, answered);
+        }
+        return (false, answered);
     }
 
     private void Note(string text)
